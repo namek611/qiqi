@@ -40,8 +40,7 @@ net = cv.dnn.readNetFromCaffe(protoc, model)
 cap = cv.VideoCapture(0)
 height = cap.get(cv.CAP_PROP_FRAME_HEIGHT)
 width = cap.get(cv.CAP_PROP_FRAME_WIDTH)
-#video_writer = cv.VideoWriter("D:/pose_estimation_demo.mp4", cv.VideoWriter_fourcc('D', 'I', 'V', 'X'), 15, (640, 480),
-#                              True)
+ 
 while cv.waitKey(1) < 0:
     hasFrame, frame = cap.read()
     if not hasFrame:
@@ -56,17 +55,15 @@ while cv.waitKey(1) < 0:
                                    (0, 0, 0), swapRB=False, crop=False)
         net.setInput(inp)
         out = net.forward()
-        #print (out)
+    
         frame_id+=1
-        #print(frame_id)
-        #print(len(BODY_PARTS), out.shape[0])
-        # assert(len(BODY_PARTS) == out.shape[1])
+     
 
         points = []
         for i in range(len(BODY_PARTS)):
             # Slice heatmap of corresponging body's part.
             heatMap = out[0, i, :, :]
-            #print(heatMap)
+           
             # Originally, we try to find all the local maximums. To simplify a sample
             # we just find a global one. However only a single pose at the same time
             # could be detected this way.
@@ -75,7 +72,7 @@ while cv.waitKey(1) < 0:
             y = (frameHeight * point[1]) / out.shape[2]
             # Add a point if it's confidence is higher than threshold.
             points.append((x, y) if conf > thr else None)
-            #print(points)
+         
 
         for pair in POSE_PAIRS:
             partFrom = pair[0]
@@ -87,7 +84,7 @@ while cv.waitKey(1) < 0:
             idTo = BODY_PARTS[partTo]
             if points[idFrom] and points[idTo]:
                 x1, y1 = points[idFrom]
-                #print (points[idFrom])
+          
                 x2, y2 = points[idTo]
                 cv.line(frame, (np.int32(x1), np.int32(y1)), (np.int32(x2), np.int32(y2)), (0, 255, 0), 3)
                 cv.ellipse(frame, (np.int32(x1), np.int32(y1)), (3, 3), 0, 0, 360, (0, 0, 255), cv.FILLED)
@@ -97,9 +94,7 @@ while cv.waitKey(1) < 0:
         freq = cv.getTickFrequency() / 1000
         elapsed_time = time.time() - time_start
         fps = frame_id / elapsed_time
-        #cv.putText(frame, '%.2fms' % (t / freq), (10, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0))
+      
         cv.putText(frame, "FPS: " + str(round(fps, 2)), (10, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0))
-
-    # video_writer.write(frame);
-    # cv.imwrite("D:/pose.png", frame)
+ 
     cv.imshow('OpenPose using OpenCV', frame)
