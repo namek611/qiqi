@@ -277,10 +277,49 @@ def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int
         return
 
     try:
-        row_content_data = json.loads(raw_json_content)
+        parsed_json = json.loads(raw_json_content)
     except json.JSONDecodeError as e:
         print(f"  - JSON解析错误 for master_item_tid {master_item_tid}: {e}")
         return
+
+    actual_business_data = None
+    # Check if parsed_json is the wrapped structure (e.g., from a direct Tianyancha API call stored in raw_row_content)
+    # This heuristic assumes 'result' and 'reason' (or 'error_code') indicate a wrapped response.
+    # AND that the 'row_content' stored by dataetlinsert.py was NOT this wrapped structure,
+    # but rather the content of such a 'result' node if the source API was wrapped.
+    # The user clarification implies raw_row_content *might* be wrapped.
+
+    if isinstance(parsed_json, dict) and 'result' in parsed_json and ('reason' in parsed_json or 'error_code' in parsed_json):
+        is_successful_wrapper = parsed_json.get('reason') == 'ok' or parsed_json.get('error_code') == 0
+        if is_successful_wrapper:
+            actual_business_data = parsed_json.get('result')
+            if actual_business_data is None: # Handles 'result': null
+                print(f"  - [信息] raw_json 是带包装结构且成功，但 'result' 内容为null。TID: {master_item_tid}。无业务数据可处理。")
+                return # No data to process
+            print(f"  - 检测到外层包装JSON，提取 'result' 节点内容进行处理。TID: {master_item_tid}")
+        else:
+            error_info = parsed_json.get('reason', f"error_code: {parsed_json.get('error_code')}")
+            print(f"  - [警告] raw_json 是带包装结构但表示失败/错误: '{error_info}'. TID: {master_item_tid}。跳过处理。")
+            # TODO: Potentially update master table status to 'ERROR_IN_RAW_DATA'
+            return
+    elif isinstance(parsed_json, (dict, list)): # Assumed to be direct business data (already unwrapped or never wrapped)
+        actual_business_data = parsed_json
+        print(f"  - raw_json 被解析为直接的业务数据（字典或列表）。TID: {master_item_tid}")
+    else:
+        print(f"  - [错误] 解析后的raw_json既不是预期的包装结构也不是字典/列表。类型: {type(parsed_json)}，TID: {master_item_tid}。跳过处理。")
+        return
+
+    # After potentially unwrapping, check if actual_business_data is something workable
+    if actual_business_data is None: # Could happen if 'result' was present but null, and it wasn't direct data
+        print(f"  - [信息] 最终业务数据为None，TID: {master_item_tid}。无业务数据可处理。")
+        return
+    if isinstance(actual_business_data, list) and not actual_business_data: # Empty list is valid for "no items"
+        print(f"  - [信息] 最终业务数据为空列表，TID: {master_item_tid}。populate_table_and_children_recursive 将处理此情况。")
+        # Let populate_table_and_children_recursive handle empty list (it should do nothing)
+    elif not isinstance(actual_business_data, (dict, list)): # Must be dict or list to proceed
+        print(f"  - [错误] 最终业务数据既不是字典也不是列表。类型: {type(actual_business_data)}，TID: {master_item_tid}。跳过处理。")
+        return
+
 
     interface_id_str = str(interface_id)
     if interface_id_str not in interface_dict:
@@ -290,28 +329,21 @@ def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int
     interface_config = interface_dict[interface_id_str]
     interface_table_prefix = interface_config[0]
 
-    # Fetch the schema for the content of row_content for this specific API
-    # This schema is what apijsontosql4.py would have used to define the detail tables.
     api_specific_row_content_schema = fetch_api_schema_from_source_parser(interface_id_str)
     if not api_specific_row_content_schema:
         print(f"  - 无法获取API ID {interface_id_str}的schema，跳过子表填充。")
         return
 
-    # Determine the first-level detail table name
-    # For row_content itself, the path is empty or 'items' depending on API structure and schema getter
-    # Assuming fetch_api_schema_from_source_parser returns the schema for the *actual content* of row_content
-    first_level_detail_table_base = get_detail_table_base_name_parser(interface_table_prefix, []) # Empty path for top level of row_content
+    first_level_detail_table_base = get_detail_table_base_name_parser(interface_table_prefix, [])
     first_level_detail_table_full = get_full_table_name_parser(first_level_detail_table_base)
-
     fk_to_master_column = f"{to_snake_case_parser(ACTUAL_MASTER_TABLE_NAME)}_tid"
 
-    # Start recursive population for the content of row_content
     populate_table_and_children_recursive(
         cursor,
-        current_data=row_content_data, # This is the dict from raw_row_content
-        current_schema=api_specific_row_content_schema, # Schema for this dict
+        current_data=actual_business_data,
+        current_schema=api_specific_row_content_schema,
         target_table_name=first_level_detail_table_full,
-        fk_to_parent_column_name=fk_to_master_column, # FK in this table points to ods_api_response_items
+        fk_to_parent_column_name=fk_to_master_column,
         parent_tid_value=master_item_tid
     )
     print(f"  - 完成主表TID: {master_item_tid} 的子表处理。")
