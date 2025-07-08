@@ -152,20 +152,80 @@ def insert_detail_data(cursor, detail_table_name: str, detail_data: Dict[str, An
 
     # 外键列名是主表名（蛇形）+ _tid
     foreign_key_column_name = f"{to_snake_case_data_insert(master_table_actual_name)}_tid"
+    data_to_insert = {}
 
-    data_to_insert = {to_snake_case_data_insert(key): value for key, value in detail_data.items()}
-    data_to_insert[foreign_key_column_name] = master_item_tid # 使用正确的外键列名和值
+    # Predefined set of fields (snake_case) known to be JSON in specific tables.
+    # This might need to be more dynamic or per-API if structures vary widely.
+    # For API 1001 (base_info), these are the JSON fields in ods_base_info_detail
+    # Note: These should be the *snake_case* versions of the API's field names.
+    # API field names: 'liquidatingInfo', 'briefCancel', 'headquarters'
+    known_json_fields = {
+        'liquidating_info',
+        'brief_cancel',
+        'headquarters'
+    }
 
-    data_to_insert_cleaned = {k: v for k, v in data_to_insert.items() if v is not None}
-    if not data_to_insert_cleaned or foreign_key_column_name not in data_to_insert_cleaned:
-        if not any(k for k in detail_data.keys()):
-            print(f"  [信息] row_content 为空，不向详情表 `{detail_table_name}` 插入数据。")
-            return
-        else:
-            print(f"  [警告] 清理后详情数据为空或缺少外键，无法插入到 {detail_table_name}。原始数据: {detail_data}")
-            return
+    for key, value in detail_data.items():
+        col_name_snake = to_snake_case_data_insert(key)
+
+        if isinstance(value, list):
+            # Skip list types, should be handled by child tables (future enhancement)
+            print(f"  [信息] 字段 '{key}' (列: {col_name_snake}) 是列表类型，跳过直接插入到 {detail_table_name}。应由子表处理。")
+            continue
+        elif isinstance(value, dict):
+            if col_name_snake in known_json_fields:
+                try:
+                    data_to_insert[col_name_snake] = json.dumps(value, ensure_ascii=False)
+                except TypeError as e:
+                    print(f"  [警告] 字段 '{key}' (列: {col_name_snake}) 序列化为JSON失败: {e}。值: {str(value)[:100]}... 跳过。")
+            else:
+                # Skip dict types if not explicitly defined as JSON columns, might be for child tables
+                print(f"  [信息] 字段 '{key}' (列: {col_name_snake}) 是字典类型，但未在预定义JSON字段中，跳过直接插入到 {detail_table_name}。可能应由子表处理。")
+            continue
+
+        # For other simple types (str, int, float, bool, None)
+        data_to_insert[col_name_snake] = value
+
+    data_to_insert[foreign_key_column_name] = master_item_tid
+
+    # It's generally safer to let the DB handle None for nullable columns,
+    # and error out if a NOT NULL column receives None.
+    # So, we don't filter out None values here.
+    data_to_insert_cleaned = data_to_insert # Keep Nones, DB will validate.
+
+    if not data_to_insert_cleaned : # Check if anything is left to insert besides FK
+        # If only FK is present, it means all other fields were filtered.
+        # This check might be too simplistic if a table *only* has an FK and other fields are optional.
+        # However, if detail_data was originally empty, this is valid.
+        if not any(k for k in detail_data.keys()): # Original detail_data was empty
+             print(f"  [信息] row_content 为空，不向详情表 `{detail_table_name}` 插入数据。")
+             return
+        # If detail_data was not empty, but all fields got filtered, it's a bit ambiguous.
+        # For now, proceed if at least the FK is there.
+
+    if foreign_key_column_name not in data_to_insert_cleaned:
+         print(f"  [警告] 外键 '{foreign_key_column_name}' 未能添加到待插入数据中，无法插入到 {detail_table_name}。数据: {data_to_insert_cleaned}")
+         return
+
 
     columns = list(data_to_insert_cleaned.keys())
+    # Ensure there are columns to insert beyond just a potential FK if all fields were complex types
+    if not columns or (len(columns) == 1 and foreign_key_column_name in columns and not any(k for k in detail_data.keys())) :
+        if not any(k for k in detail_data.keys()): # Original detail_data was empty
+             print(f"  [信息] row_content 为空或所有字段被过滤，且无简单字段可插入到详情表 `{detail_table_name}`。")
+             return
+        # If detail_data had content but all were filtered, we might still insert if only FK is needed by schema.
+        # However, most detail tables would have other data.
+        # Let's assume if only FK is left, and original data wasn't empty, something is amiss or table is just a link.
+        # For safety, if no actual data columns from row_content made it, we can skip.
+        value_columns = [col for col in columns if col != foreign_key_column_name]
+        if not value_columns and any(k for k in detail_data.keys()): # Original data existed, but all were filtered
+            print(f"  [信息] row_content 中所有字段均为复杂类型或不适用于直接插入，详情表 `{detail_table_name}` 本次无数据列更新。")
+            # Depending on requirements, one might still insert if the table allows all other columns to be NULL.
+            # For now, if no data columns, we will not proceed with the insert to avoid empty rows beyond FK.
+            return
+
+
     placeholders = ['%s'] * len(columns)
     sql = f"INSERT INTO `{detail_table_name}` ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
 
