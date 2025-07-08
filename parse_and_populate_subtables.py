@@ -1,255 +1,391 @@
 import json
 import mysql.connector
 from mysql.connector import Error
+import hashlib
+import re
+from typing import Dict, List, Any, Set
 
-# Placeholder for DB_CONFIG, should be consistent with dataetlinsert.py or centrally managed
+# --- Configuration (Should match or be loaded consistently) ---
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': 'Ec2024_12', # Replace with actual password
-    'database': 'rsk_mail'    # Replace with actual database name used by apijsontosql4.py
+    'password': 'Ec2024_12',
+    'database': 'rsk_mail'
 }
 
-# Placeholder for table name generation functions, assuming they might be needed
-# These should ideally be imported from a shared utility or replicated from apijsontosql4.py
+MYSQL_MAX_TABLE_NAME_LENGTH = 64
 TABLE_PREFIX = "ods_"
 MASTER_TABLE_BASE_NAME = "api_response_items"
-# To get ACTUAL_MASTER_TABLE_NAME, need shorten_table_name and get_full_table_name logic from apijsontosql4.py
-# For simplicity, hardcoding what it would likely be if not shortened:
-ACTUAL_MASTER_TABLE_NAME = TABLE_PREFIX + MASTER_TABLE_BASE_NAME
 
-# Placeholder for INTERFACE_DICT, defining how to map interface_id to detail table names
-# and potentially schemas or parsing logic.
-# (interface_table_prefix_for_detail, chinese_name)
+# This should be identical to the one in apijsontosql4.py
 INTERFACE_DICT = {
     "1049": ("credit_ratings", "企业信用评级"),
     "884": ("tax_ratings", "税务评级"),
-    "1001": ("base_info", "工商信息"), # Assuming 'base_info' is the prefix for API 1001
+    "1001": ("base_info", "工商信息"),
     "1163": ("person_legal_proceedings", "法律诉讼(人员)"),
-    # ... add other relevant API IDs and their configurations ...
+    "9999": ("a_very_long_interface_name_for_testing_abbreviation_rules", "超长接口名称测试缩写规则")
 }
 
+# TYPE_MAP might not be directly needed for data insertion if apijsontosql4 handles schema correctly,
+# but it's good for reference or if we need to validate types based on schema.
+TYPE_MAP_PARSER = {
+    "String": "VARCHAR(255)", "Number": "BIGINT", "Boolean": "BOOLEAN",
+    "Date": "DATE", "Object": "JSON", "Array": "JSON"
+}
+
+# --- Helper Functions (Replicated/Adapted from apijsontosql4.py) ---
 def to_snake_case_parser(name: str) -> str:
-    # Simplified snake_case, real one should be imported or replicated
-    import re
     name = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', name)
     return name.replace("__", "_").lower()
 
-def get_detail_table_full_name_parser(interface_id_str: str) -> str | None:
+def shorten_table_name_parser(name: str, max_length: int = MYSQL_MAX_TABLE_NAME_LENGTH) -> str:
+    if len(name) <= max_length: return name
+    prefix_len = len(TABLE_PREFIX)
+    core_name = name[prefix_len:]
+    max_core_len = max_length - prefix_len
+    if len(core_name) <= max_core_len: return name # Should not happen if initial check passed
+    name_hash = hashlib.md5(core_name.encode('utf-8')).hexdigest()[:5]
+    hash_len = len(name_hash) + 1
+    available_len_for_core = max_core_len - hash_len
+    if available_len_for_core <= 0: # Highly unlikely
+        return TABLE_PREFIX + core_name[:max_core_len - len(name_hash)] + name_hash
+    truncated_core = core_name[:available_len_for_core]
+    return f"{TABLE_PREFIX}{truncated_core}_{name_hash}"[:max_length]
+
+def get_full_table_name_parser(base_name_without_prefix: str) -> str:
+    prefixed_name = TABLE_PREFIX + base_name_without_prefix
+    return shorten_table_name_parser(prefixed_name)
+
+ACTUAL_MASTER_TABLE_NAME = get_full_table_name_parser(MASTER_TABLE_BASE_NAME)
+
+def get_detail_table_base_name_parser(interface_table_prefix: str, path: List[str]) -> str:
+    effective_path = [p for p in path if p != '_child'] # _child is a schema marker, not part of name path
+    if not effective_path: # Top-level detail for an interface (e.g. from row_content directly)
+         return to_snake_case_parser(f"{interface_table_prefix}_detail")
+    return to_snake_case_parser(f"{interface_table_prefix}_{'_'.join(effective_path)}_detail")
+
+# --- Schema Fetching (Crucial: Must align with apijsontosql4.py's live fetching) ---
+def fetch_api_schema_from_source_parser(api_id: str) -> Dict | None:
     """
-    Generates the full detail table name (including ods_ prefix and potential shortening)
-    for a given interface_id.
-    This is a simplified placeholder. A robust version would use the exact logic
-    from apijsontosql4.py (get_full_table_name, get_detail_table_base_name, shorten_table_name).
+    Fetches the API schema structure.
+    IMPORTANT: This function *must* replicate the exact logic of
+    `fetch_api_schema_from_source` in `apijsontosql4.py` to ensure consistency.
+    For brevity, the full replicated logic is not included here but is assumed.
+    This placeholder will use a simplified mock for known APIs.
     """
-    if interface_id_str not in INTERFACE_DICT:
-        return None
+    # This is where the full logic from apijsontosql4.py's fetch_api_schema_from_source would go.
+    # It would make an HTTP request to get the live schema.
+    # For this example, using simplified mock schemas based on previous discussions.
 
-    base_prefix = INTERFACE_DICT[interface_id_str][0]
-    # This simplified version doesn't handle path-based variations or complex shortening.
-    detail_base_name = f"{base_prefix}_detail"
-
-    # Simulate get_full_table_name (very basic, no real shortening)
-    full_name = TABLE_PREFIX + to_snake_case_parser(detail_base_name)
-    # Real shortening logic from apijsontosql4.py should be used here if names can be long
-    # For example: full_name = get_full_table_name_from_apijsontosql4_logic(detail_base_name)
-    return full_name
-
-def create_db_connection_parser():
-    # ... (same as in dataetlinsert.py) ...
-    try:
-        connection = mysql.connector.connect(**DB_CONFIG)
-        if connection.is_connected():
-            print("数据库连接成功 (parser)。")
-            return connection
-    except Error as e:
-        print(f"数据库连接失败 (parser): {e}")
-        return None
+    print(f"  [解析器] 调用 fetch_api_schema_from_source_parser 为 API ID: {api_id}")
+    # Mocked schemas based on previous discussions:
+    if api_id == "1001": #工商信息 (schema for the content of 'result' or 'result._')
+        # This schema should represent the fields directly inside the 'row_content' for API 1001
+        # (e.g., 'cancelDate', 'regStatus', 'branchList', etc.)
+        return {
+            "id": {"type": "Number", "remark": "公司id"},
+            "name": {"type": "String", "remark": "企业名"},
+            "regStatus": {"type": "String", "remark": "企业状态"},
+            "legalPersonName": {"type": "String", "remark": "法人"},
+            "branchList": {"type": "Array", "remark":"分支机构","_": {"_child": {"type": "Object", "_": {
+                "name": {"type": "String", "remark":"分支机构名称"}, "id": {"type": "Number"}, "regStatus":{"type":"String"}
+            }}}},
+            "shareHolderList": {"type": "Array", "remark":"股东信息","_": {"_child": {"type": "Object", "_": {
+                "name": {"type": "String"}, "type": {"type": "Number"},
+                "capital": {"type": "Array", "remark":"出资信息","_": {"_child": {"type":"Object", "_":{
+                    "amomon":{"type":"String"}, "percent":{"type":"String"}
+                }}}}
+            }}}},
+            "staffList": {"type": "Array", "remark":"主要人员","_": {"_child": {"type": "Object", "_": {"name": {"type": "String"}, "staffTypeName": {"type":"String"}}}}},
+            "changeList": {"type": "Array", "remark":"变更记录","_": {"_child": {"type": "Object", "_": {"changeItem": {"type": "String"},"changeTime":{"type":"String"}}}}},
+            "investList": {"type": "Array", "remark":"对外投资","_": {"_child": {"type": "Object", "_": {"name": {"type": "String"},"amount":{"type":"Number"}}}}},
+            "reportList": {"type": "Array", "remark":"年报信息","_": {"_child": {"type": "Object", "_": {"reportYear": {"type": "String"},"totalSales":{"type":"String"}}}}},
+            "licenseList": {"type": "Array", "remark":"行政许可","_": {"_child": {"type": "Object", "_": {"licencename": {"type": "String"},"todate":{"type":"String"}}}}},
+            "liquidatingInfo": {"type": "Object", "remark":"清算信息","_": {"status": {"type": "String"}}}, # Stored as JSON
+            "headquarters": {"type": "Object", "remark":"总公司信息","_": {"name": {"type": "String"}}}, # Stored as JSON
+            "briefCancel": {"type": "Object", "remark":"简易注销信息","_": {"status": {"type": "String"}}}, # Stored as JSON
+             # ... add all other simple fields from ods_base_info_detail ...
+            "legalPersonType": {"type": "Number"}, "regNumber": {"type": "String"}, "industry": {"type": "String"},
+            "companyOrgType": {"type": "String"}, "regLocation": {"type": "String"}, "estiblishTime": {"type": "String"},
+            "fromTime": {"type": "String"}, "toTime": {"type": "String"}, "businessScope": {"type": "String"},
+            "approvedTime": {"type": "String"}, "regCapital": {"type": "String"}, "regInstitute": {"type": "String"},
+            "orgNumber": {"type": "String"}, "creditCode": {"type": "String"}, "property3": {"type": "String"},
+            "updatetime": {"type": "String"}, "companyId": {"type": "Number"}, "taxNumber": {"type": "String"},
+            "email": {"type": "String"}, "website": {"type": "String"}, "phoneNumber": {"type": "String"},
+            "revokeDate": {"type": "String"}, "revokeReason": {"type": "String"}, "cancelReason": {"type": "String"}
+        }
+    elif api_id == "1049": #企业信用评级 (schema for items in result._.items array)
+         return {
+            "ratingOutlook": {"type": "String"}, "ratingDate": {"type": "String"}, "gid": {"type": "Number"},
+            "ratingCompanyName": {"type": "String"}, "bondCreditLevel": {"type": "String"},
+            "logo": {"type": "String"}, "alias": {"type": "String"}, "subjectLevel": {"type": "String"}
+        }
+    print(f"  [解析器警告] 未找到API ID {api_id} 的mock schema。请确保fetch_api_schema_from_source_parser已正确实现。")
     return None
 
+# --- Database and Core Logic ---
+def create_db_connection_parser():
+    try:
+        connection = mysql.connector.connect(**DB_CONFIG)
+        if connection.is_connected(): print("数据库连接成功 (parser)。")
+        return connection
+    except Error as e:
+        print(f"数据库连接失败 (parser): {e}")
+    return None
 
-def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int, raw_json_content: str):
+def _insert_row(cursor, table_name: str, data_dict: Dict[str, Any]) -> int | None:
+    """Helper to insert a single row and return the new tid."""
+    if not data_dict: # No data to insert (e.g. all fields were complex and handled by recursion)
+        print(f"    [信息] 表 {table_name} 无简单/JSON字段数据可插入。")
+        return None # Or raise error if this state is unexpected for a given table
+
+    columns = list(data_dict.keys())
+    placeholders = ['%s'] * len(columns)
+    sql = f"INSERT INTO `{table_name}` ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+    try:
+        cursor.execute(sql, list(data_dict.values()))
+        # print(f"    - 成功插入数据到 {table_name} (TID: {cursor.lastrowid})")
+        return cursor.lastrowid
+    except Error as e:
+        print(f"    - [数据库错误] 插入到表 `{table_name}` 失败: {e}")
+        print(f"      - SQL: {sql}")
+        print(f"      - Data: {str(data_dict)[:500]}...")
+        raise # Re-raise to be caught by transaction handler in main
+
+def populate_table_and_children_recursive(
+    cursor,
+    current_data: Any, # Can be a dict (for an object) or a list of dicts (for array items)
+    current_schema: Dict[str, Any],
+    target_table_name: str, # Full name of the table to insert current_data into
+    fk_to_parent_column_name: str | None, # Name of FK column in target_table_name that points to parent
+    parent_tid_value: int | None # Value of parent_tid for the FK
+):
     """
-    Parses the raw_json_content and inserts data into appropriate detail tables.
-    This is the core logic to be implemented.
+    Recursively populates a table and its children based on data and schema.
     """
-    print(f"\nProcessing master_item_tid: {master_item_tid}, interface_id: {interface_id}")
+    if isinstance(current_data, list): # If current_data is a list of items for the target_table_name
+        for item_data in current_data:
+            if not isinstance(item_data, dict):
+                print(f"  [警告] 列表中的项目不是字典，跳过: {item_data} (目标表: {target_table_name})")
+                continue
+            # Each item in the list gets its own row and potentially its own children
+            populate_table_and_children_recursive(cursor, item_data, current_schema, target_table_name, fk_to_parent_column_name, parent_tid_value)
+        return
+
+    # If current_data is a dictionary (a single object/row)
+    if not isinstance(current_data, dict):
+        print(f"  [警告] 当前数据不是字典，无法处理: {current_data} (目标表: {target_table_name})")
+        return
+
+    simple_fields_for_current_row = {}
+    if fk_to_parent_column_name and parent_tid_value is not None:
+        simple_fields_for_current_row[fk_to_parent_column_name] = parent_tid_value
+
+    children_to_process_later = [] # Store (child_data, child_schema, child_table_name, new_fk_col_name_for_child)
+
+    for api_field_key, api_field_value in current_data.items():
+        db_col_name = to_snake_case_parser(api_field_key)
+        field_schema = current_schema.get(api_field_key)
+
+        if not field_schema:
+            print(f"  [警告] 字段 '{api_field_key}' 在提供的schema中未找到定义，跳过。 (目标表: {target_table_name})")
+            continue
+
+        field_type = field_schema.get("type")
+
+        if field_type == "Object" and "_" in field_schema: # Nested Object
+            if api_field_value is not None: # Only process if data exists
+                # This object becomes a new child table or is stored as JSON
+                # Policy: if schema has "_", it's a structured object for a child table.
+                # If apijsontosql4.py created a JSON column for this in *this* target_table_name,
+                # then this logic needs to know that.
+                # For now, assume if it has "_", it's a child table.
+                child_table_base_name = get_detail_table_base_name_parser(to_snake_case_parser(target_table_name).replace(TABLE_PREFIX, "").replace("_detail",""), [api_field_key]) # Path is just the field key
+                child_table_full_name = get_full_table_name_parser(child_table_base_name)
+
+                # The FK in child table will point to current target_table_name's tid
+                fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
+
+                children_to_process_later.append({
+                    "data": api_field_value, "schema": field_schema["_"],
+                    "table_name": child_table_full_name,
+                    "fk_col": fk_in_child_col_name
+                })
+                # If apijsontosql4 also creates a JSON column in parent for this object (current policy)
+                # we should also populate that if this script is to be complete.
+                # For now, focusing on child table population.
+                # If 'liquidatingInfo' is an example, it is Object but stored as JSON in parent.
+                # This needs a clear rule: when is an Object a JSON column vs a child table?
+                # Rule from apijsontosql4: if it's a nested object, it creates a JSON column *and* recurses.
+                # So, we might need to insert JSON here too.
+                if target_table_name == get_full_table_name_parser("base_info_detail"): # Example for API 1001
+                    if db_col_name in ('liquidating_info', 'headquarters', 'brief_cancel'): # Known JSON fields
+                         simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value else None
+
+
+        elif field_type == "Array" and "_" in field_schema and "_child" in field_schema["_"] and \
+             isinstance(field_schema["_"]["_child"], dict) and "_" in field_schema["_"]["_child"]: # Array of Objects
+            if api_field_value is not None and isinstance(api_field_value, list) and api_field_value: # Ensure it's a non-empty list
+                child_item_schema = field_schema["_"]["_child"]["_"]
+                child_table_base_name = get_detail_table_base_name_parser(to_snake_case_parser(target_table_name).replace(TABLE_PREFIX, "").replace("_detail",""), [api_field_key])
+                child_table_full_name = get_full_table_name_parser(child_table_base_name)
+                fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
+
+                children_to_process_later.append({
+                    "data": api_field_value, "schema": child_item_schema, # Schema is for *each item* in array
+                    "table_name": child_table_full_name,
+                    "fk_col": fk_in_child_col_name,
+                    "is_list_of_items": True # Flag to iterate list in recursive call
+                })
+        else: # Simple type or Object/Array to be stored as-is (e.g. if schema type is just "Object" not "Object with _")
+            if field_type == "Object" or field_type == "Array": # Store as JSON string if schema says Object/Array but no further structure
+                simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value is not None else None
+            else: # String, Number, Boolean, Date
+                simple_fields_for_current_row[db_col_name] = api_field_value
+
+    # Insert current row's simple/JSON fields
+    current_row_tid = _insert_row(cursor, target_table_name, simple_fields_for_current_row)
+    if current_row_tid is None and simple_fields_for_current_row : # If fields existed but insert failed or returned no ID
+        print(f"  [错误] 未能为表 {target_table_name} 获取TID，无法处理其子表。数据: {simple_fields_for_current_row}")
+        # Depending on policy, this could raise an error to rollback the transaction for parent item.
+        # For now, if simple_fields_for_current_row was empty, it's fine (no row inserted, no children).
+        # If it was not empty but current_row_tid is None, it's an error from _insert_row.
+        if simple_fields_for_current_row: # If there was actual data to insert for current row.
+            raise Error(f"Insert into {target_table_name} failed to return a TID.")
+        else: # No actual data for current row (e.g. an object that only contained other lists/objects)
+            return # No row inserted for current_data, so no children can be linked.
+
+
+    # Process children, passing the new current_row_tid as their parent_tid_value
+    for child_task in children_to_process_later:
+        child_data = child_task["data"]
+        child_schema = child_task["schema"]
+        child_table_name = child_task["table_name"]
+        fk_col_in_child = child_task["fk_col"]
+
+        if child_task.get("is_list_of_items", False): # If it's an array of items for the child table
+            for item_in_list in child_data:
+                 populate_table_and_children_recursive(cursor, item_in_list, child_schema, child_table_name, fk_col_in_child, current_row_tid)
+        else: # If it's a single object for the child table
+            populate_table_and_children_recursive(cursor, child_data, child_schema, child_table_name, fk_col_in_child, current_row_tid)
+
+
+def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int, raw_json_content: str, interface_dict: Dict):
+    print(f"\n开始处理主表TID: {master_item_tid}, 接口ID: {interface_id}")
     if not raw_json_content:
         print(f"  - raw_row_content 为空，无需解析。")
         return
 
     try:
-        row_content_dict = json.loads(raw_json_content)
+        row_content_data = json.loads(raw_json_content)
     except json.JSONDecodeError as e:
         print(f"  - JSON解析错误 for master_item_tid {master_item_tid}: {e}")
         return
 
     interface_id_str = str(interface_id)
-    if interface_id_str not in INTERFACE_DICT:
-        print(f"  - 未知的 interface_id: {interface_id}，无法确定详情表。")
+    if interface_id_str not in interface_dict:
+        print(f"  - 未知的 interface_id: {interface_id}，无法在INTERFACE_DICT中找到配置。")
         return
 
-    # Determine the target detail table name (simplified)
-    # This needs to exactly match how apijsontosql4.py generates it.
-    # For API 1001, row_content_dict is the actual business fields.
-    # For API 1049, row_content_dict might be {"total": ..., "items": [...]},
-    # so we might need to extract from "items" here, or ensure `raw_row_content` stores the correct part.
-    # Assuming raw_row_content stores the part that DIRECTLY maps to the first-level detail table columns.
+    interface_config = interface_dict[interface_id_str]
+    interface_table_prefix = interface_config[0]
 
-    # Example for API 1001 (工商信息) where row_content_dict is the actual data for ods_base_info_detail
-    if interface_id == 1001: # 'base_info'
-        # This is where the logic from the old `insert_detail_data` (from dataetlinsert.py)
-        # would be adapted. It needs to know which fields are simple, which are JSON,
-        # and which correspond to further sub-tables.
+    # Fetch the schema for the content of row_content for this specific API
+    # This schema is what apijsontosql4.py would have used to define the detail tables.
+    api_specific_row_content_schema = fetch_api_schema_from_source_parser(interface_id_str)
+    if not api_specific_row_content_schema:
+        print(f"  - 无法获取API ID {interface_id_str}的schema，跳过子表填充。")
+        return
 
-        target_detail_table = get_detail_table_full_name_parser(interface_id_str)
-        if not target_detail_table:
-            print(f"  - 无法为 interface_id {interface_id} 生成详情表名。")
-            return
+    # Determine the first-level detail table name
+    # For row_content itself, the path is empty or 'items' depending on API structure and schema getter
+    # Assuming fetch_api_schema_from_source_parser returns the schema for the *actual content* of row_content
+    first_level_detail_table_base = get_detail_table_base_name_parser(interface_table_prefix, []) # Empty path for top level of row_content
+    first_level_detail_table_full = get_full_table_name_parser(first_level_detail_table_base)
 
-        print(f"  - 准备插入到详情表: {target_detail_table}")
+    fk_to_master_column = f"{to_snake_case_parser(ACTUAL_MASTER_TABLE_NAME)}_tid"
 
-        data_for_detail_table = {}
-        # Known JSON columns for ods_base_info_detail (example)
-        json_columns_for_base_info = {'liquidating_info', 'brief_cancel', 'headquarters'}
-
-        for key, value in row_content_dict.items():
-            col_name_snake = to_snake_case_parser(key)
-            if isinstance(value, list):
-                # Here, you would implement logic to iterate `value` and insert into
-                # its corresponding child table (e.g., ods_base_info_branch_list_detail).
-                # This requires knowing the child table name and its schema.
-                print(f"    - 字段 '{key}' 是列表，应插入到子表 (此功能待实现)。")
-                # Example: process_list_for_child_table(cursor, value, col_name_snake, master_item_tid_of_current_detail_table)
-            elif isinstance(value, dict):
-                if col_name_snake in json_columns_for_base_info:
-                    try:
-                        data_for_detail_table[col_name_snake] = json.dumps(value, ensure_ascii=False)
-                    except TypeError as e:
-                        print(f"    - 字段 '{key}' (列: {col_name_snake}) 序列化为JSON失败: {e}。跳过。")
-                else:
-                    # This dict might correspond to another child table.
-                    print(f"    - 字段 '{key}' 是字典但非预定义JSON，应插入到子表或作为JSON (此功能待实现/细化)。")
-                    # Example: process_dict_for_child_table(cursor, value, col_name_snake, master_item_tid_of_current_detail_table)
-            else: # Simple type
-                data_for_detail_table[col_name_snake] = value
-
-        # Add foreign key to the master ods_api_response_items table
-        # The FK column name in the detail table is based on the master table's name
-        fk_to_master_column_name = f"{to_snake_case_parser(ACTUAL_MASTER_TABLE_NAME)}_tid"
-        data_for_detail_table[fk_to_master_column_name] = master_item_tid
-
-        if not data_for_detail_table or len(data_for_detail_table) == 1 and fk_to_master_column_name in data_for_detail_table:
-            print(f"    - 没有可插入到 {target_detail_table} 的简单或JSON字段。")
-            return
-
-        columns = list(data_for_detail_table.keys())
-        placeholders = ['%s'] * len(columns)
-        sql = f"INSERT INTO `{target_detail_table}` ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-
-        try:
-            cursor.execute(sql, list(data_for_detail_table.values()))
-            print(f"    - 成功插入数据到 {target_detail_table} for master_item_tid {master_item_tid}")
-        except Error as e:
-            print(f"    - 数据库错误，插入到详情表 `{target_detail_table}` 失败: {e}")
-            print(f"      - SQL: {sql}")
-            print(f"      - Data: {str(data_for_detail_table)[:500]}")
-            # Consider how to handle partial inserts or retries if this script processes many items.
-
-    # Add more `elif interface_id == XXXX:` blocks for other APIs
-    # Each block will need specific logic to handle that API's row_content structure,
-    # including identifying simple fields, JSON fields, and fields that map to further child tables.
-
-    else:
-        print(f"  - 接口ID {interface_id} 的解析逻辑尚未实现。")
+    # Start recursive population for the content of row_content
+    populate_table_and_children_recursive(
+        cursor,
+        current_data=row_content_data, # This is the dict from raw_row_content
+        current_schema=api_specific_row_content_schema, # Schema for this dict
+        target_table_name=first_level_detail_table_full,
+        fk_to_parent_column_name=fk_to_master_column, # FK in this table points to ods_api_response_items
+        parent_tid_value=master_item_tid
+    )
+    print(f"  - 完成主表TID: {master_item_tid} 的子表处理。")
 
 
 def main():
-    """
-    Main function to fetch items from the master table and process their raw_row_content.
-    """
-    print("开始解析 ods_api_response_items 中的 raw_row_content 并填充子表...")
-
+    print("开始解析 ods_api_response_items 中的 raw_row_content 并填充子表 (增强版)...")
     connection = create_db_connection_parser()
-    if not connection:
-        return
+    if not connection: return
 
-    cursor = connection.cursor(dictionary=True) # Fetch rows as dictionaries
-
-    # TODO: Add logic to select only rows that haven't been processed yet,
-    # e.g., by adding a 'processed_status' column to ods_api_response_items,
-    # or by processing in batches based on tid or insertion time.
-    # For now, selecting all for demonstration.
+    cursor = None # Initialize cursor to None
+    current_processing_tid = None # For logging in case of error
     try:
-        # Select necessary fields from the master table
-        # Ensure ACTUAL_MASTER_TABLE_NAME is correctly defined (with ods_ prefix and shortening)
-        # Filter by the new status column: is_row_content_processed = FALSE
+        cursor = connection.cursor(dictionary=True)
         query = f"SELECT tid, interface_id, raw_row_content FROM `{ACTUAL_MASTER_TABLE_NAME}` WHERE raw_row_content IS NOT NULL AND is_row_content_processed = FALSE"
-        cursor.execute(query)
+        # For testing, you might want to limit: query += " LIMIT 1"
+        # Or process a specific problematic tid: query = f"SELECT ... WHERE tid = YOUR_TID_HERE"
 
+        cursor.execute(query)
         items_to_process = cursor.fetchall()
-        print(f"找到 {len(items_to_process)} 条包含 raw_row_content 的记录进行处理。")
+        print(f"找到 {len(items_to_process)} 条待处理记录。")
 
         for item in items_to_process:
+            current_processing_tid = item['tid'] # For error logging
             master_tid = item['tid']
             interface_id = item['interface_id']
             raw_json = item['raw_row_content']
 
-            parse_and_insert_row_content(cursor, master_tid, interface_id, raw_json)
+            print(f"--- 开始处理主记录 TID: {master_tid} ---")
+            # Start a transaction for this master record's children
+            # connection.start_transaction() # Not all connectors might have this; use set autocommit=0 / commit/rollback
+            cursor.execute("START TRANSACTION;") # Explicit transaction start
+            print(f"  - 事务开始 for TID: {master_tid}")
 
-            # After successful parsing and insertion into all subtables for this master_tid:
-            # Update the master table to mark this row as processed.
-            # This should be part of the same transaction as the subtable inserts.
+
+            parse_and_insert_row_content(cursor, master_tid, interface_id, raw_json, INTERFACE_DICT)
+
             update_sql = f"UPDATE `{ACTUAL_MASTER_TABLE_NAME}` SET is_row_content_processed = TRUE WHERE tid = %s"
-            try:
-                cursor.execute(update_sql, (master_tid,))
-                print(f"  - 标记 master_item_tid {master_tid} 为已处理。")
-            except Error as update_e:
-                print(f"  - [错误] 更新 master_item_tid {master_tid} 处理状态失败: {update_e}")
-                # Decide on error handling: rollback this item, log and continue, or stop all.
-                # For now, we'll let the main exception handler catch it if it's critical,
-                # but ideally, this update failure should trigger a rollback for this item's transaction.
-                raise # Re-raise to trigger rollback for the current item's transaction
+            cursor.execute(update_sql, (master_tid,))
+            print(f"  - 标记主记录 TID {master_tid} 为已处理。")
 
-            # Commit per item or in batches?
-            # If committing per item, the update above is included in this item's transaction.
-            connection.commit()
-            print(f"  - master_item_tid {master_tid} 的事务已提交。")
+            # connection.commit()
+            cursor.execute("COMMIT;")
+            print(f"  - 事务提交 for TID: {master_tid}")
+            print(f"--- 完成处理主记录 TID: {master_tid} ---")
+
 
     except Error as e:
-        print(f"处理主表数据时发生错误 (master_tid: {item.get('tid', 'N/A')}): {e}") # Assuming item is in scope on error
-        if connection.is_connected():
+        print(f"处理主表数据时发生数据库错误 (当前处理TID: {current_processing_tid if current_processing_tid else 'N/A'}): {e}")
+        if connection and connection.is_connected():
             print("  - 正在回滚当前事务...")
-            connection.rollback()
+            # connection.rollback()
+            cursor.execute("ROLLBACK;")
+            print("  - 事务已回滚。")
+    except Exception as ex: # Catch other Python errors
+        print(f"处理过程中发生非数据库错误 (当前处理TID: {current_processing_tid if current_processing_tid else 'N/A'}): {ex}")
+        import traceback
+        traceback.print_exc()
+        if connection and connection.is_connected() and cursor: # Check cursor too
+            print("  - 正在回滚当前事务 (因非数据库错误)...")
+            cursor.execute("ROLLBACK;")
+            print("  - 事务已回滚。")
     finally:
         if connection and connection.is_connected():
-            # Close cursor only if it was successfully created
-            if 'cursor' in locals() and cursor:
-                 cursor.close()
+            if cursor: cursor.close()
             connection.close()
-            print("数据库连接已关闭 (parser)。")
+            print("\n数据库连接已关闭 (parser)。")
 
 if __name__ == "__main__":
-    """
-    这个脚本的目的是：
-    1. 从主表 `ods_api_response_items` 读取之前存储的 `raw_row_content` JSON字符串。
-    2. 解析这个JSON。
-    3. 根据 `interface_id`，将解析后的数据分发并插入到相应的 `ods_*_detail` 子表中。
-    4. 对于 `row_content` 中本身就包含列表或复杂嵌套对象的字段（例如工商信息中的股东列表、分支机构列表），
-       此脚本需要进一步的递归逻辑来将这些嵌套数据插入到更深层次的子表（例如 `ods_base_info_shareholder_list_detail`）。
-
-    当前的实现是一个基础框架，主要演示了如何读取主表数据和调用一个初步的解析函数。
-    `parse_and_insert_row_content` 函数需要针对每个 `interface_id` 进行定制化实现，
-    以正确处理其特定的 `row_content` 结构和目标子表。
-    表名生成、列名转换等辅助函数应与 `apijsontosql4.py` 保持一致。
-    """
-    if DB_CONFIG.get('user') == 'your_username': # Basic check
+    if DB_CONFIG.get('user') == 'your_username':
         print("[警告] 请在脚本顶部更新您的 `DB_CONFIG` (parser) 数据库连接信息！")
     else:
         main()
-        print("\n--- 子表填充过程执行完毕 (初步实现) ---")
-        print("请注意：此脚本是子表填充逻辑的占位符和初步框架。")
-        print("需要针对每个API接口的 `row_content` 结构详细实现其解析和到对应子表的插入逻辑，")
-        print("特别是处理列表和嵌套对象到更深层子表的功能。")
-
+        print("\n--- 子表填充过程执行完毕 ---")
+        print("请注意：此脚本实现了基于schema的递归子表填充。")
+        print("确保 `fetch_api_schema_from_source_parser` 能准确获取或模拟各API的schema结构。")
 ```
