@@ -77,9 +77,10 @@ def generate_master_table_sql() -> tuple[str, str]:
         gen_column_sql("last_update_time", "String", "最后更新时间"),
         gen_column_sql("interface_id", "Number", "接口ID"),
         gen_column_sql("interface_name", "String", "接口名称"),
-        gen_column_sql("raw_row_content", "Object", "原始的row_content JSON内容") # Object maps to JSON type
+        gen_column_sql("raw_row_content", "Object", "原始的row_content JSON内容"), # Object maps to JSON type
+        "  `is_row_content_processed` BOOLEAN NOT NULL DEFAULT FALSE COMMENT '原始row_content是否已解析并填充到子表'"
     ]
-    table_comment = "API响应条目主表，存储每个API调用返回的基础信息及原始row_content"
+    table_comment = "API响应条目主表，存储每个API调用返回的基础信息、原始row_content及处理状态"
     sql = f"CREATE TABLE IF NOT EXISTS `{actual_master_table_name}` (\n"
     sql += ",\n".join(columns)
     sql += f"\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='{table_comment}';"

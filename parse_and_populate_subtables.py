@@ -183,7 +183,8 @@ def main():
     try:
         # Select necessary fields from the master table
         # Ensure ACTUAL_MASTER_TABLE_NAME is correctly defined (with ods_ prefix and shortening)
-        query = f"SELECT tid, interface_id, raw_row_content FROM `{ACTUAL_MASTER_TABLE_NAME}` WHERE raw_row_content IS NOT NULL"
+        # Filter by the new status column: is_row_content_processed = FALSE
+        query = f"SELECT tid, interface_id, raw_row_content FROM `{ACTUAL_MASTER_TABLE_NAME}` WHERE raw_row_content IS NOT NULL AND is_row_content_processed = FALSE"
         cursor.execute(query)
 
         items_to_process = cursor.fetchall()
@@ -195,17 +196,36 @@ def main():
             raw_json = item['raw_row_content']
 
             parse_and_insert_row_content(cursor, master_tid, interface_id, raw_json)
-            # Commit per item or in batches? For simplicity, commit per item for now.
-            # In a production system, batch commits are better.
+
+            # After successful parsing and insertion into all subtables for this master_tid:
+            # Update the master table to mark this row as processed.
+            # This should be part of the same transaction as the subtable inserts.
+            update_sql = f"UPDATE `{ACTUAL_MASTER_TABLE_NAME}` SET is_row_content_processed = TRUE WHERE tid = %s"
+            try:
+                cursor.execute(update_sql, (master_tid,))
+                print(f"  - 标记 master_item_tid {master_tid} 为已处理。")
+            except Error as update_e:
+                print(f"  - [错误] 更新 master_item_tid {master_tid} 处理状态失败: {update_e}")
+                # Decide on error handling: rollback this item, log and continue, or stop all.
+                # For now, we'll let the main exception handler catch it if it's critical,
+                # but ideally, this update failure should trigger a rollback for this item's transaction.
+                raise # Re-raise to trigger rollback for the current item's transaction
+
+            # Commit per item or in batches?
+            # If committing per item, the update above is included in this item's transaction.
             connection.commit()
+            print(f"  - master_item_tid {master_tid} 的事务已提交。")
 
     except Error as e:
-        print(f"处理主表数据时发生错误: {e}")
+        print(f"处理主表数据时发生错误 (master_tid: {item.get('tid', 'N/A')}): {e}") # Assuming item is in scope on error
         if connection.is_connected():
-            connection.rollback() # Rollback on error if processing multiple items in one transaction
+            print("  - 正在回滚当前事务...")
+            connection.rollback()
     finally:
         if connection and connection.is_connected():
-            cursor.close()
+            # Close cursor only if it was successfully created
+            if 'cursor' in locals() and cursor:
+                 cursor.close()
             connection.close()
             print("数据库连接已关闭 (parser)。")
 
