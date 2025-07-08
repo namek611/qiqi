@@ -122,8 +122,26 @@ def insert_master_data(cursor, item_data: Dict[str, Any]) -> int | None:
         'disabled': item_data.get('disabled'),
         'last_update_time': item_data.get('last_update_time'),
         'interface_id': item_data.get('interface_id'),
-        'interface_name': item_data.get('interface_name')
+        'interface_name': item_data.get('interface_name'),
     }
+
+    # Add raw_row_content, serialized to JSON
+    raw_content = item_data.get('row_content')
+    if raw_content is not None and isinstance(raw_content, dict):
+        try:
+            master_data['raw_row_content'] = json.dumps(raw_content, ensure_ascii=False)
+        except TypeError as e:
+            print(f"  [警告] 序列化 row_content 到JSON失败: {e}。将存为NULL。row_content: {str(raw_content)[:200]}...")
+            master_data['raw_row_content'] = None
+    elif raw_content is not None: # Not a dict, store as is if simple, or null if complex non-dict
+        if isinstance(raw_content, (str, int, float, bool)):
+             master_data['raw_row_content'] = raw_content # Or json.dumps(raw_content) to be safe if column is JSON
+        else:
+            print(f"  [警告] row_content 不是字典类型也不是简单类型，将存为NULL。类型: {type(raw_content)}")
+            master_data['raw_row_content'] = None
+    else:
+        master_data['raw_row_content'] = None
+
     master_data_cleaned = {k: v for k, v in master_data.items() if v is not None}
     columns = [to_snake_case_data_insert(k) for k in master_data_cleaned.keys()] # Ensure snake case for columns
     placeholders = ['%s'] * len(columns)
@@ -262,19 +280,21 @@ def process_and_insert_api_items(
     for item in api_items:
         master_tid = insert_master_data(cursor, item) # 返回的是主表的 tid
         if master_tid is None:
-            print(f"  [错误] 插入主数据失败，跳过此条目: {item.get('name')}")
+            print(f"  [错误] 插入主数据（包括raw_row_content）失败，跳过此条目: {item.get('name')}")
             continue
 
-        print(f"    - 主数据插入到 `{master_table_actual_name}` (TID: {master_tid}) for company '{item.get('name')}'")
+        print(f"    - 主数据（含raw_row_content）插入到 `{master_table_actual_name}` (TID: {master_tid}) for company '{item.get('name')}'")
 
-        row_content = item.get('row_content')
-        if row_content and isinstance(row_content, dict):
-            insert_detail_data(cursor, actual_detail_table_name, row_content, master_tid, master_table_actual_name)
-            print(f"      - 详情数据插入到 `{actual_detail_table_name}` (master_tid: {master_tid})")
-        elif row_content:
-            print(f"      - [警告] `row_content` 不是预期的字典格式，无法处理。内容: {type(row_content)}")
-        else:
-            print(f"      - [信息] 此条目无 `row_content` 数据。")
+        # row_content = item.get('row_content') # 保留此行以备调试或未来可能的双重写入策略
+        # Per Option A, insert_detail_data call is removed.
+        # Sub-table population will be handled by a new script using raw_row_content from the master table.
+        # if row_content and isinstance(row_content, dict):
+            # insert_detail_data(cursor, actual_detail_table_name, row_content, master_tid, master_table_actual_name)
+            # print(f"      - [旧逻辑已注释] 详情数据插入到 `{actual_detail_table_name}` (master_tid: {master_tid})")
+        # elif row_content:
+            # print(f"      - [旧逻辑已注释] `row_content` 不是预期的字典格式，无法处理。内容: {type(row_content)}")
+        # else:
+            # print(f"      - [旧逻辑已注释] 此条目无 `row_content` 数据。")
 
 # ============================= 4. 主执行函数 =============================
 
