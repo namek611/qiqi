@@ -192,14 +192,18 @@ def fetch_api_schema_from_source(api_id: str) -> Dict | None:
         if not return_param_str:
             print(f"警告: API ID {api_id} 的响应中未找到 'returnParam' 字段。", file=sys.stderr)
             return None
+
         return_param_dict = json.loads(return_param_str)
         result_node = return_param_dict.get("result", {})
         if not result_node or not isinstance(result_node, dict):
             print(f"警告: API ID {api_id} 的 'result' 节点无效或缺失。", file=sys.stderr)
             return None
-        items_node = result_node.get("items")
-        if items_node and isinstance(items_node, dict) and items_node.get("type") == "Array":
-            items_structure = items_node.get("_")
+
+        # Path 1: Standard list items directly under result (e.g., result.items._._child._)
+        # This is for APIs where 'result' directly contains 'items' array.
+        items_node_direct = result_node.get("items")
+        if items_node_direct and isinstance(items_node_direct, dict) and items_node_direct.get("type") == "Array":
+            items_structure = items_node_direct.get("_")
             if items_structure and isinstance(items_structure, dict):
                 child_node = items_structure.get("_child")
                 if child_node and isinstance(child_node, dict) and child_node.get("type") == "Object":
@@ -207,23 +211,68 @@ def fetch_api_schema_from_source(api_id: str) -> Dict | None:
                     if child_fields and isinstance(child_fields, dict):
                         print(f"  [信息] API {api_id}: 使用 result.items._._child._ 结构作为 row_content 的schema。")
                         return child_fields
+
+        # Path 2: Items nested under result._ (e.g., result._.items._._child._)
+        # This is for APIs like 1049 where 'result' has a '_' child, and 'items' is under that.
         result_underscore_node = result_node.get("_")
-        if result_underscore_node:
-            if isinstance(result_underscore_node, dict):
-                 print(f"  [信息] API {api_id}: 使用 result._ 结构作为 row_content 的schema。")
-                 return result_underscore_node
-            elif isinstance(result_underscore_node, str):
-                try:
-                    print(f"  [信息] API {api_id}: 解析 result._ 字符串结构作为 row_content 的schema。")
-                    return json.loads(result_underscore_node)
-                except json.JSONDecodeError:
-                    print(f"  [错误] API {api_id}: result._ 字符串无法被解析为JSON。", file=sys.stderr)
-                    return None
-        if not result_underscore_node and all(isinstance(v, dict) and "type" in v for v in result_node.values()):
+        if result_underscore_node and isinstance(result_underscore_node, dict):
+            items_node_nested = result_underscore_node.get("items")
+            if items_node_nested and isinstance(items_node_nested, dict) and items_node_nested.get("type") == "Array":
+                items_structure = items_node_nested.get("_")
+                if items_structure and isinstance(items_structure, dict):
+                    child_node = items_structure.get("_child")
+                    if child_node and isinstance(child_node, dict) and child_node.get("type") == "Object":
+                        child_fields = child_node.get("_")
+                        if child_fields and isinstance(child_fields, dict):
+                            print(f"  [信息] API {api_id}: 使用 result._.items._._child._ 结构作为 row_content 的schema。")
+                            return child_fields
+
+            # Path 3: result._ itself is the schema (and not a wrapper with 'items')
+            # This must come after checking for 'items' inside result._
+            if not items_node_nested: # If there were no 'items' directly under result._
+                # Check if result_underscore_node itself looks like a field schema, not a wrapper
+                is_not_wrapper = not ('total' in result_underscore_node and 'items' in result_underscore_node)
+                # Further check: ensure it has type definitions, typical for a schema object
+                is_schema_like = all(isinstance(v, dict) and "type" in v for v in result_underscore_node.values())
+
+                if is_not_wrapper and is_schema_like and result_underscore_node: # ensure not empty
+                    print(f"  [信息] API {api_id}: 使用 result._ 结构作为 row_content 的schema。")
+                    return result_underscore_node
+
+        # Path 4: result._ is a JSON string that needs parsing
+        if result_underscore_node and isinstance(result_underscore_node, str):
+            try:
+                # This parsed schema could itself be a wrapper or the direct item schema.
+                # For simplicity, we'll assume if it's a string, it's the direct schema.
+                # More sophisticated parsing could re-apply checks here.
+                parsed_schema_from_string = json.loads(result_underscore_node)
+                print(f"  [信息] API {api_id}: 解析 result._ 字符串结构作为 row_content 的schema。")
+                # Potentially, this parsed_schema_from_string could also have an 'items' array.
+                # For now, we assume it's the direct schema of row_content.
+                # A more robust solution might recursively call a schema parsing helper.
+                # Example: if parsed_schema_from_string itself has an 'items' key of type Array.
+                # items_in_parsed_str = parsed_schema_from_string.get("items")
+                # if items_in_parsed_str and isinstance(items_in_parsed_str, dict) and items_in_parsed_str.get("type") == "Array":
+                #    ... further drill down ...
+                # else: return parsed_schema_from_string
+
+                return parsed_schema_from_string
+            except json.JSONDecodeError:
+                print(f"  [错误] API {api_id}: result._ 字符串无法被解析为JSON。", file=sys.stderr)
+                # Fall through to other checks or final warning
+
+        # Path 5: result itself is the schema (e.g., no '_', no 'items' directly under result)
+        # This should be a last resort.
+        if not items_node_direct and not result_underscore_node and \
+           all(isinstance(v, dict) and "type" in v for v in result_node.values()) and result_node: # ensure not empty
             print(f"  [信息] API {api_id}: 使用 result 本身作为 row_content 的schema。")
             return result_node
+
         print(f"警告: API ID {api_id} 未能从获取的schema中定位到 'row_content' 的详细字段定义。检查API文档结构。", file=sys.stderr)
+        # For debugging, one might print the structure that was not matched:
+        # print(f"  [调试信息] API {api_id} result_node: {json.dumps(result_node, indent=2, ensure_ascii=False)}", file=sys.stderr)
         return None
+
     except requests.exceptions.RequestException as e:
         print(f"错误: 请求API ID {api_id} 的schema时发生网络错误: {e}", file=sys.stderr)
         return None
