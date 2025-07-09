@@ -305,33 +305,57 @@ def populate_table_and_children_recursive(
             # Simple type, or Object/Array to be stored as JSON string directly in this table
             # (because schema doesn't have "_" or "_._child._" indicating further structure for separate tables)
             processed_value = api_field_value
-            # Determine target SQL type to decide if empty string should be NULL
-            # This uses the same logic as apijsontosql4.py's gen_column_sql type determination
-            notice_sql_type, _ = parse_notice_for_type_length(field_schema.get("notice", ""))
+            processed_value = api_field_value
+            notice_str = field_schema.get("notice", "")
             meta_api_type = field_schema.get("type") # "String", "Number", "Boolean", "Date", "Object", "Array"
+            db_sql_type, _ = parse_notice_for_type_length(notice_str)
 
-            if isinstance(api_field_value, str) and not api_field_value.strip():
-                # Default assumption: if notice provides a clear non-textual SQL type, or meta_api_type suggests non-textual, convert '' to None.
-                # Otherwise, for "String" meta type where notice doesn't specify, '' is kept as is.
+            # Step 1: Handle Empty/Whitespace Strings
+            if isinstance(processed_value, str) and not processed_value.strip():
+                is_target_non_textual_for_empty = False
+                if db_sql_type:
+                    if db_sql_type.upper() not in ["VARCHAR", "CHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT"]:
+                        is_target_non_textual_for_empty = True
+                elif meta_api_type in ["Number", "Boolean", "Date"]:
+                    is_target_non_textual_for_empty = True
 
-                is_target_non_textual = False
-                if notice_sql_type: # Notice is primary source of truth for DB type
-                    if notice_sql_type.upper() not in ["VARCHAR", "CHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT"]:
-                        is_target_non_textual = True
-                elif meta_api_type in ["Number", "Boolean", "Date"]: # Fallback to meta type
-                    is_target_non_textual = True
-
-                if is_target_non_textual:
-                    print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 值为空白字符串，目标类型非纯文本，将转换为NULL。Notice: '{field_schema.get('notice', '')}', MetaType: '{meta_api_type}'")
+                if is_target_non_textual_for_empty:
+                    print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 值为空白字符串，目标类型非纯文本，将转换为NULL。Notice: '{notice_str}', MetaType: '{meta_api_type}'")
                     processed_value = None
-                else:
-                    # For "String" meta type without a more specific non-textual type from notice, '' is kept.
-                    pass # processed_value remains ''
+                # else: processed_value remains '', which is fine for text types.
 
-            if field_type == "Object" or field_type == "Array": # This is the schema-defined type for the field
-                # If it's meant to be stored as a JSON string in *this* table (no further "_" structure in schema)
+            # Step 2: Handle Percentage Strings (if processed_value is still a string and not None)
+            if isinstance(processed_value, str) and processed_value.endswith('%'):
+                is_target_numeric_for_percent = False
+                if db_sql_type:
+                    if db_sql_type.upper() in ["DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "INT", "INTEGER", "BIGINT", "TINYINT", "SMALLINT", "MEDIUMINT"]:
+                        is_target_numeric_for_percent = True
+                elif meta_api_type == "Number": # Fallback if notice didn't specify a numeric SQL type
+                    is_target_numeric_for_percent = True
+
+                if is_target_numeric_for_percent:
+                    try:
+                        # Remove '%' and any potential thousands separators (like comma)
+                        cleaned_val_str = processed_value.rstrip('%').replace(',', '')
+                        # Convert to float. Database will handle further conversion to DECIMAL/INT.
+                        # If data is like "4.17%" -> 4.17
+                        # If data is like "0.05%" (meaning 0.0005), this simple replace is not enough.
+                        # Assuming "X%" means X, not X/100, for now.
+                        # If "X%" actually means X/100, then: float(cleaned_val_str) / 100.0
+                        processed_value = float(cleaned_val_str)
+                        print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 转换为数字: {processed_value}")
+                    except ValueError:
+                        print(f"    - [数据转换警告] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 无法转换为有效数字，将设为NULL。")
+                        processed_value = None
+
+            # Assign to row after all processing for this simple field
+            # Note: field_type here is from the API schema's "type" (String, Number, Object, Array)
+            # It determines if json.dumps is needed for Object/Array types that are NOT being turned into child tables.
+            if field_type == "Object" or field_type == "Array":
+                # This case applies if the schema says it's an Object/Array but there's no "_" structure
+                # indicating it should be a child table. So, it's stored as JSON in the current table.
                 simple_fields_for_current_row[db_col_name] = json.dumps(processed_value, ensure_ascii=False) if processed_value is not None else None
-            else: # String, Number, Boolean, Date from schema
+            else: # String, Number, Boolean, Date from schema (after our specific value processing)
                 simple_fields_for_current_row[db_col_name] = processed_value
 
     current_row_tid = _insert_row(cursor, target_table_name, simple_fields_for_current_row)
