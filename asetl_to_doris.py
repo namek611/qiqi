@@ -662,62 +662,59 @@ def stream_load_data_to_doris(doris_host_http, doris_port_http, doris_user, dori
             timeout=config.DORIS_STREAM_LOAD_TIMEOUT if hasattr(config, 'DORIS_STREAM_LOAD_TIMEOUT') else 300 # Default 5 mins timeout
         )
 
-        # It's good practice to check response content type before trying to parse as JSON
-        if 'application/json' in response.headers.get('Content-Type', ''):
+        try:
             resp_json = response.json()
             logging.debug(f"Stream Load raw JSON response for {doris_table_name}: {json.dumps(resp_json, indent=2)}")
-        else: # Fallback if not JSON, though Doris usually returns JSON
-            logging.warning(f"Stream Load response for {doris_table_name} was not JSON. Status: {response.status_code}. Text: {response.text[:500]}")
-            # If status code indicates success (e.g. 200 OK), but not JSON, might still be a success.
-            # Or it could be an HTML error page from a proxy.
-            if 200 <= response.status_code < 300:
-                 logging.info(f"Stream Load for {doris_table_name} returned HTTP {response.status_code} but non-JSON response. Assuming success based on status code.")
-                 return True # Or investigate further based on response.text
-            else:
-                 response.raise_for_status() # This will raise an HTTPError if status is 4xx or 5xx
-                 return False # Should be caught by raise_for_status
+        except json.JSONDecodeError:
+            # Log the fact that response was not JSON, even if HTTP status was 200
+            logging.error(
+                f"Stream Load response for {doris_table_name} was not valid JSON. "
+                f"Status Code: {response.status_code}. Response Text (first 500 chars): {response.text[:500]}"
+            )
+            # If HTTP status code indicates an error, or if it's a 2xx but not JSON (which is unexpected for Doris Stream Load success)
+            if response.status_code >= 300 : # Treat non-2xx as error
+                 response.raise_for_status() # Raise HTTPError for bad status codes
+                 return False # Should be caught by HTTPError handler below
+            else: # 2xx status but not JSON - this is problematic
+                 logging.error(f"Stream Load for {doris_table_name} returned HTTP {response.status_code} but response was not JSON. This is unexpected for a successful load.")
+                 return False # Treat as a failure because we expect JSON
 
         # Process JSON response
         status = resp_json.get("Status")
+        # Enhanced logging for all relevant details, especially for Fail status
+        log_details = {
+            "TxnId": resp_json.get("TxnId"),
+            "Label": resp_json.get("Label"),
+            "Status": status,
+            "Message": resp_json.get("Message"),
+            "NumberTotalRows": resp_json.get("NumberTotalRows"),
+            "NumberLoadedRows": resp_json.get("NumberLoadedRows"),
+            "NumberFilteredRows": resp_json.get("NumberFilteredRows"),
+            "NumberUnselectedRows": resp_json.get("NumberUnselectedRows"),
+            "LoadBytes": resp_json.get("LoadBytes"),
+            "LoadTimeMs": resp_json.get("LoadTimeMs") if resp_json.get("LoadTimeMs") is not None else resp_json.get("LoadTimeMillis"), # Older versions might use LoadTimeMillis
+            "ErrorURL": resp_json.get("ErrorURL"),
+            "Comment": resp_json.get("Comment")
+        }
+        log_message_parts = [f"{k}={v}" for k, v in log_details.items() if v is not None]
+
         if status == "Success":
-            logging.info(f"Stream Load Success for {doris_table_name}: "
-                         f"TxnId={resp_json.get('TxnId')}, "
-                         f"Loaded={resp_json.get('NumberLoadedRows')}, "
-                         f"Filtered={resp_json.get('NumberFilteredRows')}, "
-                         f"Unselected={resp_json.get('NumberUnselectedRows')}, "
-                         f"TotalRows={resp_json.get('NumberTotalRows')}, "
-                         f"LoadTimeMs={resp_json.get('LoadTimeMillis')}ms")
-            if resp_json.get('NumberFilteredRows', 0) > 0 or resp_json.get('NumberUnselectedRows', 0) > 0:
-                logging.warning(f"Some rows were filtered or unselected during Stream Load for {doris_table_name}. ErrorURL: {resp_json.get('ErrorURL')}")
+            logging.info(f"Stream Load Success for {doris_table_name}: {', '.join(log_message_parts)}")
+            if log_details.get('NumberFilteredRows', 0) > 0 or log_details.get('NumberUnselectedRows', 0) > 0:
+                logging.warning(f"Some rows were filtered or unselected during Stream Load for {doris_table_name}. ErrorURL: {log_details.get('ErrorURL')}")
             return True
         elif status == "Publish Timeout":
-            # This means data is loaded but FE hasn't received confirmation from all BEs in time.
-            # Data is likely okay. TxnId can be used to check `SHOW LOAD WHERE TxnId = ...`
-            logging.warning(f"Stream Load for {doris_table_name} resulted in Publish Timeout. "
-                            f"TxnId={resp_json.get('TxnId')}. Data may still be loaded. Check Doris logs/SHOW LOAD. "
-                            f"Message: {resp_json.get('Message', 'N/A')}")
+            logging.warning(f"Stream Load for {doris_table_name} resulted in Publish Timeout: {', '.join(log_message_parts)}. Data may still be loaded. Check Doris logs/SHOW LOAD.")
             return True # Treat as success for now, but requires monitoring.
         elif status == "Label Already Exists":
-            # This can happen if a previous attempt with the same label (auto-generated or custom) succeeded or is in progress.
-            # If using auto-generated labels by Doris (by not providing "label" header), this is less common.
-            # If providing custom labels, ensure they are unique for each load batch.
-            logging.warning(f"Stream Load for {doris_table_name} failed: Label Already Exists. "
-                            f"TxnId={resp_json.get('TxnId')}. Label='{resp_json.get('Label', 'N/A')}'. "
-                            f"Message: {resp_json.get('Message', 'N/A')}")
-            # This might be a transient issue if a retry mechanism is in place with new labels.
-            # For a single run, this is an issue to investigate.
-            return False # Or True if this is acceptable (e.g. data already loaded by that label)
-        else: # Other Failures
-            logging.error(f"Stream Load failed for {doris_table_name}. Status: {status}. "
-                          f"TxnId={resp_json.get('TxnId')}. Label='{resp_json.get('Label', 'N/A')}'. "
-                          f"Message: {resp_json.get('Message', 'N/A')}")
-            if "ErrorURL" in resp_json:
-                logging.error(f"  Error details URL: {resp_json['ErrorURL']}")
+            logging.warning(f"Stream Load for {doris_table_name} failed (Label Already Exists): {', '.join(log_message_parts)}")
+            return False
+        else: # Other Failures (includes "Fail" status from the initial problem)
+            logging.error(f"Stream Load failed for {doris_table_name}: {', '.join(log_message_parts)}")
             # Log FailMessageList if present (Doris 2.0+)
             if "FailMessageList" in resp_json and resp_json["FailMessageList"]:
                  for fail_msg_item in resp_json["FailMessageList"]:
-                     logging.error(f"  Failed row sample: {fail_msg_item.get('ErrorRowSample')} | Reason: {fail_msg_item.get('ErrorMsg')}")
-
+                     logging.error(f"  Failed row sample for {doris_table_name}: {fail_msg_item.get('ErrorRowSample')} | Reason: {fail_msg_item.get('ErrorMsg')}")
             return False
 
     except requests.exceptions.Timeout as e:
@@ -732,11 +729,9 @@ def stream_load_data_to_doris(doris_host_http, doris_port_http, doris_user, dori
     except requests.exceptions.RequestException as e: # Catch-all for other requests issues
         logging.error(f"Generic Stream Load request exception for {doris_table_name}: {e}")
         return False
-    except json.JSONDecodeError as e: # If response.json() fails
-        logging.error(f"Failed to decode JSON response from Stream Load for {doris_table_name}: {e}. "
-                      f"Response Status: {response.status_code if 'response' in locals() else 'N/A'}. "
-                      f"Response Text: {response.text[:500] if 'response' in locals() else 'N/A'}")
-        return False
+    # Note: json.JSONDecodeError is handled within the first try-except block now.
+    # If it occurs and response.status_code < 300, it's treated as an error explicitly.
+    # If response.status_code >= 300, raise_for_status() would be called, leading to HTTPError.
     except Exception as e: # Catch any other unexpected errors
         logging.error(f"An unexpected error occurred during stream load for {doris_table_name}: {e}")
         return False
