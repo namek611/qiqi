@@ -216,14 +216,26 @@ def populate_table_and_children_recursive(
     current_schema: Dict[str, Any],
     target_table_name: str,
     fk_to_parent_column_name: str | None,
-    parent_tid_value: int | None
+    parent_tid_value: int | None,
+    original_interface_prefix: str, # Added: The root prefix for the API interface (e.g., "base_info")
+    current_field_path: List[str]    # Added: The path of keys from root of row_content to current_data
 ):
     if isinstance(current_data, list):
+        # If current_data is a list, it means we are processing items of an array field from the parent.
+        # The current_schema should be the schema for *each item* in this list.
+        # The target_table_name is the table where these list items should be stored.
         for item_data in current_data:
             if not isinstance(item_data, dict):
                 print(f"  [警告] 列表中的项目不是字典，跳过: {str(item_data)[:100]} (目标表: {target_table_name})")
                 continue
-            populate_table_and_children_recursive(cursor, item_data, current_schema, target_table_name, fk_to_parent_column_name, parent_tid_value)
+            # Each item is processed as a new row in the target_table_name,
+            # using the same schema, parent FK, and path context.
+            # The original_interface_prefix remains the same. current_field_path also refers to the list field itself.
+            populate_table_and_children_recursive(
+                cursor, item_data, current_schema,
+                target_table_name, fk_to_parent_column_name, parent_tid_value,
+                original_interface_prefix, current_field_path
+            )
         return
 
     if not isinstance(current_data, dict):
@@ -248,43 +260,50 @@ def populate_table_and_children_recursive(
 
         if field_type == "Object" and "_" in field_schema:
             if api_field_value is not None:
-                # Determine original interface prefix for consistent child table naming
-                # This assumes target_table_name was formed like ods_{interface_prefix}_detail or ods_{interface_prefix}_path_detail
-                original_interface_prefix = target_table_name.replace(TABLE_PREFIX, "").split('_detail')[0]
-                if '_'.join(original_interface_prefix.split('_')[:-1]) : # if it was like base_info_branch_list
-                    original_interface_prefix = '_'.join(original_interface_prefix.split('_')[:-1])
-
-
-                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, [api_field_key]) # Path for child is just its key
+                # Child's path is current path + this field's key
+                child_field_path = current_field_path + [api_field_key]
+                # Use original_interface_prefix and the new accumulated path for child table name
+                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, child_field_path)
                 child_table_full_name = get_full_table_name_parser(child_table_base_name)
-                fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
+
+                fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid" # FK in child points to current table's tid
 
                 children_to_process_later.append({
-                    "data": api_field_value, "schema": field_schema["_"],
+                    "data": api_field_value,
+                    "schema": field_schema["_"],
                     "table_name": child_table_full_name,
-                    "fk_col": fk_in_child_col_name
+                    "fk_col": fk_in_child_col_name,
+                    "original_interface_prefix": original_interface_prefix, # Pass down root prefix
+                    "field_path": child_field_path # Pass down accumulated path
                 })
-                if target_table_name == get_full_table_name_parser("base_info_detail"):
-                    if db_col_name in ('liquidating_info', 'headquarters', 'brief_cancel'):
+                # Logic for also storing as JSON in parent (if applicable based on apijsontosql4's rules)
+                if target_table_name == get_full_table_name_parser(get_detail_table_base_name_parser(original_interface_prefix, [])): # If current table is the first-level detail table
+                    # This condition needs to be more robust or rely on apijsontosql4's output for which fields are JSON in parent
+                    # Example: For base_info, specific objects are also JSON in parent.
+                    if original_interface_prefix == "base_info" and db_col_name in ('liquidating_info', 'headquarters', 'brief_cancel'):
                          simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value else None
+
         elif field_type == "Array" and "_" in field_schema and "_child" in field_schema["_"] and \
              isinstance(field_schema["_"]["_child"], dict) and "_" in field_schema["_"]["_child"]:
             if api_field_value is not None and isinstance(api_field_value, list) and api_field_value:
                 child_item_schema = field_schema["_"]["_child"]["_"]
-                original_interface_prefix = target_table_name.replace(TABLE_PREFIX, "").split('_detail')[0]
-                if '_'.join(original_interface_prefix.split('_')[:-1]) :
-                    original_interface_prefix = '_'.join(original_interface_prefix.split('_')[:-1])
-
-                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, [api_field_key])
+                child_field_path = current_field_path + [api_field_key]
+                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, child_field_path)
                 child_table_full_name = get_full_table_name_parser(child_table_base_name)
                 fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
+
                 children_to_process_later.append({
-                    "data": api_field_value, "schema": child_item_schema,
+                    "data": api_field_value, # This is the list of items
+                    "schema": child_item_schema, # Schema for each item in the list
                     "table_name": child_table_full_name,
                     "fk_col": fk_in_child_col_name,
-                    "is_list_of_items": True
+                    "is_list_of_items": True, # Flag that data is a list
+                    "original_interface_prefix": original_interface_prefix,
+                    "field_path": child_field_path
                 })
         else:
+            # Simple type, or Object/Array to be stored as JSON string directly in this table
+            # (because schema doesn't have "_" or "_._child._" indicating further structure for separate tables)
             if field_type == "Object" or field_type == "Array":
                 simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value is not None else None
             else:
@@ -303,12 +322,23 @@ def populate_table_and_children_recursive(
         child_schema = child_task["schema"]
         child_table_name = child_task["table_name"]
         fk_col_in_child = child_task["fk_col"]
+        # Pass down original_interface_prefix and the child's specific field_path
+        child_original_interface_prefix = child_task["original_interface_prefix"]
+        child_field_path = child_task["field_path"]
 
         if child_task.get("is_list_of_items", False):
             for item_in_list in child_data:
-                 populate_table_and_children_recursive(cursor, item_in_list, child_schema, child_table_name, fk_col_in_child, current_row_tid)
+                 populate_table_and_children_recursive(
+                     cursor, item_in_list, child_schema,
+                     child_table_name, fk_col_in_child, current_row_tid,
+                     child_original_interface_prefix, child_field_path # Pass context
+                 )
         else:
-            populate_table_and_children_recursive(cursor, child_data, child_schema, child_table_name, fk_col_in_child, current_row_tid)
+            populate_table_and_children_recursive(
+                cursor, child_data, child_schema,
+                child_table_name, fk_col_in_child, current_row_tid,
+                child_original_interface_prefix, child_field_path # Pass context
+            )
 
 def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int, raw_json_content: str, interface_dict: Dict):
     # ... (logic to determine actual_business_data from raw_json_content - remains same as v7)
@@ -375,7 +405,9 @@ def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int
         current_schema=api_specific_row_content_schema,
         target_table_name=first_level_detail_table_full,
         fk_to_parent_column_name=fk_to_master_column,
-        parent_tid_value=master_item_tid
+        parent_tid_value=master_item_tid,
+        original_interface_prefix=interface_table_prefix, # Pass the root interface prefix
+        current_field_path=[] # Initial path is empty for the top-level row_content
     )
     print(f"  - 完成主表TID: {master_item_tid} 的子表处理。")
 
