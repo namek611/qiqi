@@ -304,17 +304,54 @@ def populate_table_and_children_recursive(
         else:
             # Simple type, or Object/Array to be stored as JSON string directly in this table
             # (because schema doesn't have "_" or "_._child._" indicating further structure for separate tables)
-            if field_type == "Object" or field_type == "Array":
-                simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value is not None else None
-            else:
-                simple_fields_for_current_row[db_col_name] = api_field_value
+            processed_value = api_field_value
+            # Determine target SQL type to decide if empty string should be NULL
+            # This uses the same logic as apijsontosql4.py's gen_column_sql type determination
+            notice_sql_type, _ = parse_notice_for_type_length(field_schema.get("notice", ""))
+            meta_api_type = field_schema.get("type") # "String", "Number", "Boolean", "Date", "Object", "Array"
+
+            if isinstance(api_field_value, str) and not api_field_value.strip():
+                # Default assumption: if notice provides a clear non-textual SQL type, or meta_api_type suggests non-textual, convert '' to None.
+                # Otherwise, for "String" meta type where notice doesn't specify, '' is kept as is.
+
+                is_target_non_textual = False
+                if notice_sql_type: # Notice is primary source of truth for DB type
+                    if notice_sql_type.upper() not in ["VARCHAR", "CHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT"]:
+                        is_target_non_textual = True
+                elif meta_api_type in ["Number", "Boolean", "Date"]: # Fallback to meta type
+                    is_target_non_textual = True
+
+                if is_target_non_textual:
+                    print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 值为空白字符串，目标类型非纯文本，将转换为NULL。Notice: '{field_schema.get('notice', '')}', MetaType: '{meta_api_type}'")
+                    processed_value = None
+                else:
+                    # For "String" meta type without a more specific non-textual type from notice, '' is kept.
+                    pass # processed_value remains ''
+
+            if field_type == "Object" or field_type == "Array": # This is the schema-defined type for the field
+                # If it's meant to be stored as a JSON string in *this* table (no further "_" structure in schema)
+                simple_fields_for_current_row[db_col_name] = json.dumps(processed_value, ensure_ascii=False) if processed_value is not None else None
+            else: # String, Number, Boolean, Date from schema
+                simple_fields_for_current_row[db_col_name] = processed_value
 
     current_row_tid = _insert_row(cursor, target_table_name, simple_fields_for_current_row)
     if current_row_tid is None:
-        if simple_fields_for_current_row and not (len(simple_fields_for_current_row)==1 and fk_to_parent_column_name in simple_fields_for_current_row):
-            # Only raise error if there were actual data fields to insert beyond just the FK
-            raise Error(f"Insert into {target_table_name} (with data) failed to return a TID.")
+        # Check if simple_fields_for_current_row actually had data fields beyond a possible FK
+        data_fields_count = 0
+        for k,v_ in simple_fields_for_current_row.items():
+            if k != fk_to_parent_column_name:
+                data_fields_count +=1
+
+        if data_fields_count > 0 : # If there were actual data fields to insert for this row
+            raise Error(f"Insert into {target_table_name} (with data fields) failed to return a TID.")
         else: # No actual data fields, or only FK, so no row was (or needed to be) inserted. No children.
+            # This means current_data was empty or only contained complex types that will be handled by children_to_process_later
+            # but no simple fields for *this* table row itself.
+            # print(f"    [信息] 表 {target_table_name} 没有简单/JSON字段插入，但可能有子表待处理。")
+            # We need a TID if there are children. If an object is just a container for other lists/objects
+            # and has no simple fields itself, apijsontosql4.py might not even create a parent row for it,
+            # or it creates a row with just FK. This needs consistent handling.
+            # For now, if _insert_row returns None, we assume no row was inserted, so no children can be linked from it.
             return
 
     for child_task in children_to_process_later:
