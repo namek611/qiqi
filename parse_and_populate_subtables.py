@@ -338,14 +338,11 @@ def populate_table_and_children_recursive(
                         # Remove '%' and any potential thousands separators (like comma)
                         cleaned_val_str = processed_value.rstrip('%').replace(',', '')
                         # Convert to float. Database will handle further conversion to DECIMAL/INT.
-                        # If data is like "4.17%" -> 4.17
-                        # If data is like "0.05%" (meaning 0.0005), this simple replace is not enough.
-                        # Assuming "X%" means X, not X/100, for now.
-                        # If "X%" actually means X/100, then: float(cleaned_val_str) / 100.0
-                        processed_value = float(cleaned_val_str)
-                        print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 转换为数字: {processed_value}")
+                        # If data is like "4.17%" -> 0.0417
+                        processed_value = float(cleaned_val_str) / 100.0
+                        print(f"    - [数据转换] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 转换为实际值: {processed_value}")
                     except ValueError:
-                        print(f"    - [数据转换警告] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 无法转换为有效数字，将设为NULL。")
+                        print(f"    - [数据转换警告] 字段 '{api_field_key}' (列: {db_col_name}) 百分比值 '{api_field_value}' 无法剔除百分号后转换为数字，将设为NULL。")
                         processed_value = None
 
             # Assign to row after all processing for this simple field
