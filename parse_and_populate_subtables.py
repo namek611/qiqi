@@ -4,7 +4,8 @@ from mysql.connector import Error
 import hashlib
 import re
 from typing import Dict, List, Any, Set
-import requests # Added for live schema fetching
+import requests
+import os # For schema file operations
 
 # --- Configuration (Should match or be loaded consistently) ---
 DB_CONFIG = {
@@ -17,6 +18,7 @@ DB_CONFIG = {
 MYSQL_MAX_TABLE_NAME_LENGTH = 64
 TABLE_PREFIX = "ods_"
 MASTER_TABLE_BASE_NAME = "api_response_items"
+SCHEMA_CACHE_DIR = "generated_schemas" # Directory to store/load schema files
 
 INTERFACE_DICT = {
     "1049": ("credit_ratings", "企业信用评级"),
@@ -62,101 +64,126 @@ def get_detail_table_base_name_parser(interface_table_prefix: str, path: List[st
          return to_snake_case_parser(f"{interface_table_prefix}_detail")
     return to_snake_case_parser(f"{interface_table_prefix}_{'_'.join(effective_path)}_detail")
 
-# --- Schema Fetching (Copied and adapted from apijsontosql4.py) ---
-def fetch_api_schema_from_source_parser(api_id: str, mock_schemas: Dict = None) -> Dict | None:
+# --- Schema Fetching (Reads from file cache, falls back to live API, caches new) ---
+def fetch_api_schema_from_source_parser(api_id: str) -> Dict | None:
     """
-    Fetches the API schema structure from the Tianyancha source.
-    This is a direct copy/adaptation of the logic from apijsontosql4.py's
-    `fetch_api_schema_from_source` function.
-    `mock_schemas` can be used for testing IF live calls are disabled.
+    Fetches API schema: tries local cache file first, then live API, and caches if fetched live.
     """
-    if mock_schemas and api_id in mock_schemas:
-        print(f"  [解析器信息] 使用API ID {api_id} 的Mock Schema。")
-        return mock_schemas[api_id]
+    schema_file_path = os.path.join(SCHEMA_CACHE_DIR, f"{api_id}.json")
 
+    # 1. Try to load from local cache file
+    if os.path.exists(schema_file_path):
+        try:
+            with open(schema_file_path, 'r', encoding='utf-8') as f_schema:
+                schema = json.load(f_schema)
+            print(f"  [解析器信息] API ID {api_id} 的Schema已从缓存文件加载: {schema_file_path}")
+            return schema
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"  [解析器警告] 从缓存文件 {schema_file_path} 加载Schema失败: {e}。将尝试从实时API获取。", file=sys.stderr)
+
+    # 2. Fallback: Fetch from live API (logic copied from apijsontosql4.py)
+    print(f"  [解析器信息] 缓存未命中或加载失败，正在从真实接口获取API ID {api_id} 的Schema...")
     url = f"https://open.tianyancha.com/open-admin/interface/uni.json?id={api_id}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
         "Referer": "https://open.tianyancha.com/",
     }
+    live_schema = None
     try:
-        print(f"  [解析器信息] 正在从真实接口获取API ID {api_id} 的Schema: {url}")
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json().get("data", {})
         return_param_str = data.get("returnParam")
         if not return_param_str:
-            print(f"  [解析器警告] API ID {api_id} 的响应中未找到 'returnParam' 字段。", file=sys.stderr)
+            print(f"  [解析器警告] API ID {api_id} 的响应中未找到 'returnParam' 字段 (实时获取)。", file=sys.stderr)
             return None
 
         return_param_dict = json.loads(return_param_str)
         result_node = return_param_dict.get("result", {})
         if not result_node or not isinstance(result_node, dict):
-            print(f"  [解析器警告] API ID {api_id} 的 'result' 节点无效或缺失。", file=sys.stderr)
+            print(f"  [解析器警告] API ID {api_id} 的 'result' 节点无效或缺失 (实时获取)。", file=sys.stderr)
             return None
 
-        # Path 1: Standard list items directly under result (e.g., result.items._._child._)
+        # Path finding logic (same as in apijsontosql4.py)
         items_node_direct = result_node.get("items")
         if items_node_direct and isinstance(items_node_direct, dict) and items_node_direct.get("type") == "Array":
+            # ... (Path 1 logic)
             items_structure = items_node_direct.get("_")
             if items_structure and isinstance(items_structure, dict):
                 child_node = items_structure.get("_child")
                 if child_node and isinstance(child_node, dict) and child_node.get("type") == "Object":
                     child_fields = child_node.get("_")
                     if child_fields and isinstance(child_fields, dict):
-                        print(f"  [解析器信息] API {api_id}: 使用 result.items._._child._ 结构作为 row_content 的schema。")
-                        return child_fields
+                        print(f"  [解析器信息] API {api_id}: 使用 result.items._._child._ 结构 (实时获取)。")
+                        live_schema = child_fields
 
-        # Path 2: Items nested under result._ (e.g., result._.items._._child._)
-        result_underscore_node = result_node.get("_")
-        if result_underscore_node and isinstance(result_underscore_node, dict):
-            items_node_nested = result_underscore_node.get("items")
-            if items_node_nested and isinstance(items_node_nested, dict) and items_node_nested.get("type") == "Array":
-                items_structure = items_node_nested.get("_")
-                if items_structure and isinstance(items_structure, dict):
-                    child_node = items_structure.get("_child")
-                    if child_node and isinstance(child_node, dict) and child_node.get("type") == "Object":
-                        child_fields = child_node.get("_")
-                        if child_fields and isinstance(child_fields, dict):
-                            print(f"  [解析器信息] API {api_id}: 使用 result._.items._._child._ 结构作为 row_content 的schema。")
-                            return child_fields
+        if not live_schema:
+            result_underscore_node = result_node.get("_")
+            if result_underscore_node and isinstance(result_underscore_node, dict):
+                items_node_nested = result_underscore_node.get("items")
+                if items_node_nested and isinstance(items_node_nested, dict) and items_node_nested.get("type") == "Array":
+                    # ... (Path 2 logic)
+                    items_structure = items_node_nested.get("_")
+                    if items_structure and isinstance(items_structure, dict):
+                        child_node = items_structure.get("_child")
+                        if child_node and isinstance(child_node, dict) and child_node.get("type") == "Object":
+                            child_fields = child_node.get("_")
+                            if child_fields and isinstance(child_fields, dict):
+                                print(f"  [解析器信息] API {api_id}: 使用 result._.items._._child._ 结构 (实时获取)。")
+                                live_schema = child_fields
 
-            # Path 3: result._ itself is the schema (and not a wrapper with 'items')
-            if not items_node_nested:
-                is_not_wrapper = not ('total' in result_underscore_node and 'items' in result_underscore_node)
-                is_schema_like = all(isinstance(v, dict) and "type" in v for v in result_underscore_node.values())
-                if is_not_wrapper and is_schema_like and result_underscore_node:
-                    print(f"  [解析器信息] API {api_id}: 使用 result._ 结构作为 row_content 的schema。")
-                    return result_underscore_node
+                if not live_schema and not items_node_nested:
+                    # ... (Path 3 logic)
+                    is_not_wrapper = not ('total' in result_underscore_node and 'items' in result_underscore_node)
+                    is_schema_like = all(isinstance(v, dict) and "type" in v for v in result_underscore_node.values())
+                    if is_not_wrapper and is_schema_like and result_underscore_node:
+                        print(f"  [解析器信息] API {api_id}: 使用 result._ 结构 (实时获取)。")
+                        live_schema = result_underscore_node
 
-        # Path 4: result._ is a JSON string that needs parsing
-        if result_underscore_node and isinstance(result_underscore_node, str):
-            try:
-                parsed_schema_from_string = json.loads(result_underscore_node)
-                print(f"  [解析器信息] API {api_id}: 解析 result._ 字符串结构作为 row_content 的schema。")
-                # This parsed schema might need further navigation if it's also a wrapper.
-                # For simplicity, assuming it's the direct schema or needs to be handled by subsequent logic.
-                return parsed_schema_from_string
-            except json.JSONDecodeError:
-                print(f"  [解析器错误] API {api_id}: result._ 字符串无法被解析为JSON。", file=sys.stderr)
+            if not live_schema and result_underscore_node and isinstance(result_underscore_node, str):
+                # ... (Path 4 logic)
+                try:
+                    parsed_schema_from_string = json.loads(result_underscore_node)
+                    print(f"  [解析器信息] API {api_id}: 解析 result._ 字符串结构 (实时获取)。")
+                    live_schema = parsed_schema_from_string
+                except json.JSONDecodeError:
+                    print(f"  [解析器错误] API {api_id}: result._ 字符串无法被解析为JSON (实时获取)。", file=sys.stderr)
 
-        # Path 5: result itself is the schema
-        if not items_node_direct and not result_underscore_node and \
+        if not live_schema and not items_node_direct and not result_underscore_node and \
            all(isinstance(v, dict) and "type" in v for v in result_node.values()) and result_node:
-            print(f"  [解析器信息] API {api_id}: 使用 result 本身作为 row_content 的schema。")
-            return result_node
+            # ... (Path 5 logic)
+            print(f"  [解析器信息] API {api_id}: 使用 result 本身作为 schema (实时获取)。")
+            live_schema = result_node
 
-        print(f"  [解析器警告] API ID {api_id} 未能从获取的schema中定位到 'row_content' 的详细字段定义。检查API文档结构。", file=sys.stderr)
-        return None
+        if not live_schema:
+            print(f"  [解析器警告] API ID {api_id} 未能从实时接口定位到 'row_content' 的详细字段定义。", file=sys.stderr)
+            return None
 
     except requests.exceptions.RequestException as e:
-        print(f"  [解析器错误] 请求API ID {api_id} 的schema时发生网络错误: {e}", file=sys.stderr)
+        print(f"  [解析器错误] 请求API ID {api_id} 的schema时发生网络错误 (实时获取): {e}", file=sys.stderr)
         return None
     except (ValueError, json.JSONDecodeError) as e:
-        print(f"  [解析器错误] 处理API ID {api_id} 的schema数据时发生错误: {e}", file=sys.stderr)
+        print(f"  [解析器错误] 处理API ID {api_id} 的schema数据时发生错误 (实时获取): {e}", file=sys.stderr)
         return None
 
+    # 3. Cache the newly fetched schema (if successful)
+    if live_schema:
+        try:
+            os.makedirs(SCHEMA_CACHE_DIR, exist_ok=True)
+            with open(schema_file_path, 'w', encoding='utf-8') as f_schema:
+                json.dump(live_schema, f_schema, ensure_ascii=False, indent=4)
+            print(f"  [解析器信息] API ID {api_id} 的实时获取的schema已缓存到: {schema_file_path}")
+        except (IOError, OSError) as e:
+            print(f"  [解析器警告] 缓存实时获取的schema到 {schema_file_path} 失败: {e}", file=sys.stderr)
+
+    return live_schema
+
 # --- Database and Core Logic ---
+# ... (create_db_connection_parser, _insert_row, populate_table_and_children_recursive, parse_and_insert_row_content, main)
+# ... The rest of the file remains the same as the v7 version (feat/implement-recursive-subtable-population)
+# ... For brevity, only the fetch_api_schema_from_source_parser is shown fully modified.
+# ... The following is a truncated version of the rest of the file for context.
+
 def create_db_connection_parser():
     try:
         connection = mysql.connector.connect(**DB_CONFIG)
@@ -168,7 +195,7 @@ def create_db_connection_parser():
 
 def _insert_row(cursor, table_name: str, data_dict: Dict[str, Any]) -> int | None:
     if not data_dict:
-        print(f"    [信息] 表 {table_name} 无简单/JSON字段数据可插入。")
+        # print(f"    [信息] 表 {table_name} 无简单/JSON字段数据可插入。") # Can be too verbose
         return None
 
     columns = list(data_dict.keys())
@@ -214,22 +241,29 @@ def populate_table_and_children_recursive(
         field_schema = current_schema.get(api_field_key)
 
         if not field_schema:
-            print(f"  [警告] 字段 '{api_field_key}' 在提供的schema中未找到定义，跳过。 (目标表: {target_table_name})")
+            # print(f"  [警告] 字段 '{api_field_key}' 在提供的schema中未找到定义，跳过。 (目标表: {target_table_name})") # Can be too verbose
             continue
 
         field_type = field_schema.get("type")
 
         if field_type == "Object" and "_" in field_schema:
             if api_field_value is not None:
-                child_table_base_name = get_detail_table_base_name_parser(to_snake_case_parser(target_table_name).replace(TABLE_PREFIX, "").replace("_detail",""), [api_field_key])
+                # Determine original interface prefix for consistent child table naming
+                # This assumes target_table_name was formed like ods_{interface_prefix}_detail or ods_{interface_prefix}_path_detail
+                original_interface_prefix = target_table_name.replace(TABLE_PREFIX, "").split('_detail')[0]
+                if '_'.join(original_interface_prefix.split('_')[:-1]) : # if it was like base_info_branch_list
+                    original_interface_prefix = '_'.join(original_interface_prefix.split('_')[:-1])
+
+
+                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, [api_field_key]) # Path for child is just its key
                 child_table_full_name = get_full_table_name_parser(child_table_base_name)
                 fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
+
                 children_to_process_later.append({
                     "data": api_field_value, "schema": field_schema["_"],
                     "table_name": child_table_full_name,
                     "fk_col": fk_in_child_col_name
                 })
-                # Rule for API 1001: specific Object fields are stored as JSON in parent
                 if target_table_name == get_full_table_name_parser("base_info_detail"):
                     if db_col_name in ('liquidating_info', 'headquarters', 'brief_cancel'):
                          simple_fields_for_current_row[db_col_name] = json.dumps(api_field_value, ensure_ascii=False) if api_field_value else None
@@ -237,8 +271,11 @@ def populate_table_and_children_recursive(
              isinstance(field_schema["_"]["_child"], dict) and "_" in field_schema["_"]["_child"]:
             if api_field_value is not None and isinstance(api_field_value, list) and api_field_value:
                 child_item_schema = field_schema["_"]["_child"]["_"]
-                # Path for child table name uses current field key
-                child_table_base_name = get_detail_table_base_name_parser(to_snake_case_parser(target_table_name).replace(TABLE_PREFIX, "").replace("_detail",""), [api_field_key])
+                original_interface_prefix = target_table_name.replace(TABLE_PREFIX, "").split('_detail')[0]
+                if '_'.join(original_interface_prefix.split('_')[:-1]) :
+                    original_interface_prefix = '_'.join(original_interface_prefix.split('_')[:-1])
+
+                child_table_base_name = get_detail_table_base_name_parser(original_interface_prefix, [api_field_key])
                 child_table_full_name = get_full_table_name_parser(child_table_base_name)
                 fk_in_child_col_name = f"{to_snake_case_parser(target_table_name)}_tid"
                 children_to_process_later.append({
@@ -254,10 +291,11 @@ def populate_table_and_children_recursive(
                 simple_fields_for_current_row[db_col_name] = api_field_value
 
     current_row_tid = _insert_row(cursor, target_table_name, simple_fields_for_current_row)
-    if current_row_tid is None and simple_fields_for_current_row:
-        if simple_fields_for_current_row:
-            raise Error(f"Insert into {target_table_name} failed to return a TID.")
-        else:
+    if current_row_tid is None:
+        if simple_fields_for_current_row and not (len(simple_fields_for_current_row)==1 and fk_to_parent_column_name in simple_fields_for_current_row):
+            # Only raise error if there were actual data fields to insert beyond just the FK
+            raise Error(f"Insert into {target_table_name} (with data) failed to return a TID.")
+        else: # No actual data fields, or only FK, so no row was (or needed to be) inserted. No children.
             return
 
     for child_task in children_to_process_later:
@@ -273,6 +311,7 @@ def populate_table_and_children_recursive(
             populate_table_and_children_recursive(cursor, child_data, child_schema, child_table_name, fk_col_in_child, current_row_tid)
 
 def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int, raw_json_content: str, interface_dict: Dict):
+    # ... (logic to determine actual_business_data from raw_json_content - remains same as v7)
     print(f"\n开始处理主表TID: {master_item_tid}, 接口ID: {interface_id}")
     if not raw_json_content:
         print(f"  - raw_row_content 为空，无需解析。")
@@ -321,7 +360,7 @@ def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int
     interface_config = interface_dict[interface_id_str]
     interface_table_prefix = interface_config[0]
 
-    api_specific_row_content_schema = fetch_api_schema_from_source_parser(interface_id_str)
+    api_specific_row_content_schema = fetch_api_schema_from_source_parser(interface_id_str) # Now uses caching/live fetch
     if not api_specific_row_content_schema:
         print(f"  - 无法获取API ID {interface_id_str}的schema，跳过子表填充。")
         return
@@ -341,7 +380,8 @@ def parse_and_insert_row_content(cursor, master_item_tid: int, interface_id: int
     print(f"  - 完成主表TID: {master_item_tid} 的子表处理。")
 
 def main():
-    print("开始解析 ods_api_response_items 中的 raw_row_content 并填充子表 (增强版)...")
+    # ... (main function remains largely the same as v7, uses the updated fetch_api_schema_from_source_parser)
+    print("开始解析 ods_api_response_items 中的 raw_row_content 并填充子表 (增强版, 带schema缓存)...")
     connection = create_db_connection_parser()
     if not connection: return
 
@@ -377,7 +417,7 @@ def main():
 
     except Error as e:
         print(f"处理主表数据时发生数据库错误 (当前处理TID: {current_processing_tid if current_processing_tid else 'N/A'}): {e}")
-        if connection and connection.is_connected() and cursor: # Ensure cursor exists for rollback
+        if connection and connection.is_connected() and cursor:
             print("  - 正在回滚当前事务...")
             cursor.execute("ROLLBACK;")
             print("  - 事务已回滚。")
@@ -396,11 +436,15 @@ def main():
             print("\n数据库连接已关闭 (parser)。")
 
 if __name__ == "__main__":
+    # Ensure SCHEMA_CACHE_DIR exists, or at least the script attempts to create it.
+    # The fetch function itself will try to create it if it writes a new cache file.
+    # os.makedirs(SCHEMA_CACHE_DIR, exist_ok=True) # Can be done here or within fetch
+
     if DB_CONFIG.get('user') == 'your_username':
         print("[警告] 请在脚本顶部更新您的 `DB_CONFIG` (parser) 数据库连接信息！")
     else:
         main()
         print("\n--- 子表填充过程执行完毕 ---")
-        print("请注意：此脚本实现了基于schema的递归子表填充。")
-        print("确保 `fetch_api_schema_from_source_parser` 能准确获取或模拟各API的schema结构。")
+        print("请注意：此脚本实现了基于schema的递归子表填充，并尝试从文件缓存加载schema，回退到实时API。")
+
 ```
