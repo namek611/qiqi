@@ -40,11 +40,72 @@ def get_full_table_name(base_name_without_prefix: str) -> str:
     prefixed_name = TABLE_PREFIX + base_name_without_prefix
     return shorten_table_name(prefixed_name)
 
-def gen_column_sql(field_name: str, field_type: str, remark: str, is_primary_key: bool = False) -> str:
-    col_type = TYPE_MAP.get(field_type, "VARCHAR(255)")
+def parse_notice_for_type_length(notice_str: str) -> tuple[str | None, str | None]:
+    """Parses a notice string to extract SQL type and length if possible."""
+    if not notice_str: return None, None
+    notice_str_lower = notice_str.lower()
+
+    # Varchar, Char with length: e.g., varchar(100), char(10)
+    match = re.fullmatch(r"(varchar|char)\s*\((\d+)\)", notice_str_lower)
+    if match:
+        return match.group(1).upper(), match.group(2) # Type, Length
+
+    # Int, Bigint, etc. (potentially with display width, which we usually ignore for storage type)
+    # For types like int(11), bigint(20), we'll just extract the base type.
+    # MySQL's (N) for integer types is display width, not storage size.
+    match = re.fullmatch(r"(tinyint|smallint|mediumint|int|integer|bigint)\s*(?:\(\d+\))?", notice_str_lower)
+    if match:
+        return match.group(1).upper(), None # Return base type, no specific length needed from (N)
+
+    # Decimal: e.g., decimal(10,2)
+    match = re.fullmatch(r"(decimal|numeric)\s*\((\d+)\s*,\s*(\d+)\)", notice_str_lower)
+    if match:
+        return match.group(1).upper(), f"{match.group(2)},{match.group(3)}" # Type, "Precision,Scale"
+
+    # Simple types without length in notice, e.g., TEXT, DATE, DATETIME, JSON, BOOLEAN, FLOAT, DOUBLE
+    # Also, if notice just says "int" or "bigint" without (N)
+    simple_type_patterns = [
+        "text", "date", "datetime", "timestamp", "json", "blob",
+        "boolean", "float", "double", "longtext", "mediumtext", "tinytext"
+    ]
+    for stype_pattern in simple_type_patterns:
+        if notice_str_lower == stype_pattern:
+            return stype_pattern.upper(), None
+
+    return None, None # Unable to parse specific type/length
+
+def gen_column_sql(field_name: str, field_type_from_meta: str, remark: str, notice: str = "", is_primary_key: bool = False) -> str:
+    parsed_type, parsed_details = parse_notice_for_type_length(notice)
+
+    final_col_type = ""
+
+    if parsed_type:
+        if parsed_details: # For VARCHAR(N), CHAR(N), DECIMAL(P,S)
+            final_col_type = f"{parsed_type}({parsed_details})"
+        else: # For INT, BIGINT, TEXT, DATE, JSON etc. where (N) is optional or not for storage size
+            final_col_type = parsed_type
+    else:
+        # Fallback to TYPE_MAP based on field_type_from_meta ('String', 'Number', etc.)
+        # This also handles cases where notice was empty or uninformative.
+        if field_type_from_meta == "String":
+            final_col_type = "VARCHAR(255)" # Default for String if notice doesn't specify
+        elif field_type_from_meta == "Number":
+            final_col_type = "BIGINT" # Default for Number if notice doesn't specify an int/decimal type
+        elif field_type_from_meta == "Boolean":
+            final_col_type = "BOOLEAN"
+        elif field_type_from_meta == "Date": # Assuming field_type_from_meta could be "Date"
+             final_col_type = "DATE"
+        elif field_type_from_meta == "Object" or field_type_from_meta == "Array":
+             final_col_type = "JSON" # Default for complex types if not further specified by notice
+        else: # Fallback for unknown meta types
+            final_col_type = "VARCHAR(255)"
+            print(f"  [警告] 未知的元数据类型 '{field_type_from_meta}' 且 notice 未提供类型信息，回退到 VARCHAR(255) for field '{field_name}'.")
+
+
     clean_remark = remark.replace('\n', ' ').replace('\r', '') if remark else ''
     actual_field_name = "tid" if is_primary_key else to_snake_case(field_name)
-    column_definition = f"  `{actual_field_name}` {col_type}"
+    column_definition = f"  `{actual_field_name}` {final_col_type}"
+
     if is_primary_key: column_definition += " AUTO_INCREMENT PRIMARY KEY"
     if clean_remark: column_definition += f" COMMENT '{clean_remark}'"
     return column_definition
@@ -53,14 +114,14 @@ def generate_master_table_sql() -> tuple[str, str]:
     master_table_base_name = "api_response_items"
     actual_master_table_name = get_full_table_name(master_table_base_name)
     columns = [
-        gen_column_sql("id", "Number", "主键ID (统一为tid)", is_primary_key=True),
-        gen_column_sql("company_name", "String", "公司名称"),
-        gen_column_sql("disabled", "Boolean", "是否禁用"),
-        gen_column_sql("last_update_time", "String", "最后更新时间"),
-        gen_column_sql("interface_id", "Number", "接口ID"),
-        gen_column_sql("interface_name", "String", "接口名称"),
-        gen_column_sql("raw_row_content", "Object", "原始的row_content JSON内容"),
-        "  `is_row_content_processed` BOOLEAN NOT NULL DEFAULT FALSE COMMENT '原始row_content是否已解析并填充到子表'"
+        gen_column_sql("id", "Number", "主键ID (统一为tid)", "", is_primary_key=True), # Notice is empty for these general cols
+        gen_column_sql("company_name", "String", "公司名称", ""),
+        gen_column_sql("disabled", "Boolean", "是否禁用", ""),
+        gen_column_sql("last_update_time", "String", "最后更新时间", ""),
+        gen_column_sql("interface_id", "Number", "接口ID", ""),
+        gen_column_sql("interface_name", "String", "接口名称", ""),
+        gen_column_sql("raw_row_content", "Object", "原始的row_content JSON内容", "JSON"), # Explicitly use JSON type via notice if TYPE_MAP is not enough
+        "  `is_row_content_processed` BOOLEAN NOT NULL DEFAULT FALSE COMMENT '原始row_content是否已解析并填充到子表'" # This one is hardcoded string
     ]
     table_comment = "API响应条目主表，存储每个API调用返回的基础信息、原始row_content及处理状态"
     sql = f"CREATE TABLE IF NOT EXISTS `{actual_master_table_name}` (\n" + ",\n".join(columns) + \
@@ -83,8 +144,8 @@ def parse_api_schema_for_detail_tables(
     if actual_detail_table_name in PROCESSED_TABLES: return
 
     columns = [
-        gen_column_sql("id", "Number", "主键ID (统一为tid)", is_primary_key=True),
-        gen_column_sql(f"{master_table_actual_name}_tid", "Number", f"外键, 关联 `{master_table_actual_name}`.tid")
+        gen_column_sql("id", "Number", "主键ID (统一为tid)", notice="", is_primary_key=True), # PK notice usually not from API meta
+        gen_column_sql(f"{master_table_actual_name}_tid", "Number", f"外键, 关联 `{master_table_actual_name}`.tid", notice="") # FK notice usually not from API meta
     ]
     recursive_calls_args_list = []
     for field_key, field_meta in fields_schema.items():
@@ -92,22 +153,43 @@ def parse_api_schema_for_detail_tables(
         if snake_case_key == "tid" or snake_case_key == f"{to_snake_case(master_table_actual_name)}_tid":
             if not (isinstance(field_meta, dict) and field_meta.get("type") == "Object" and "_" in field_meta) and \
                not (isinstance(field_meta, dict) and field_meta.get("type") == "Array" and "_" in field_meta):
-                 print(f"  [警告] 字段 '{field_key}' ...与主键或外键名冲突...", file=sys.stderr) # Simplified
+                 print(f"  [警告] 字段 '{field_key}' (转换为 '{snake_case_key}') 与主键或外键名冲突，将跳过为此简单字段生成专用列。", file=sys.stderr)
                  continue
-        if field_key == "_child" and isinstance(field_meta, dict) and field_meta.get("type") == "Object" and "_" in field_meta:
+
+        # Pass the notice field to gen_column_sql
+        notice_val = field_meta.get("notice", "")
+        col_type_from_meta = field_meta.get("type", "String")
+        col_remark = field_meta.get("remark", "")
+
+        if field_key == "_child" and isinstance(field_meta, dict) and col_type_from_meta == "Object" and "_" in field_meta:
+            # This is part of schema definition for items in an array, fields are processed directly.
+            # The recursive call for the array items themselves handles this structure.
+            # This specific 'if' might be redundant if fields_schema is always the direct item schema.
             pass
-        elif isinstance(field_meta, dict) and field_meta.get("type") == "Object" and "_" in field_meta:
+        elif col_type_from_meta == "Object" and "_" in field_meta: # Nested Object
             recursive_calls_args_list.append({"fields_schema": field_meta["_"], "interface_table_prefix": interface_table_prefix,
                 "interface_chinese_name": interface_chinese_name, "current_path": current_path + [field_key],
                 "master_table_actual_name": actual_detail_table_name})
-            columns.append(gen_column_sql(field_key, "Object", field_meta.get("remark", "") + " (嵌套对象，关联子表或存为JSON)"))
-        elif isinstance(field_meta, dict) and field_meta.get("type") == "Array" and "_" in field_meta and \
-             "_child" in field_meta["_"] and isinstance(field_meta["_"]["_child"], dict) and "_" in field_meta["_"]["_child"]:
+            # Add a JSON column in parent table for this object, as per current strategy
+            columns.append(gen_column_sql(field_key, col_type_from_meta, col_remark + " (嵌套对象，关联子表或存为JSON)", notice_val))
+        elif col_type_from_meta == "Array" and "_" in field_meta and \
+             "_child" in field_meta["_"] and isinstance(field_meta["_"]["_child"], dict) and "_" in field_meta["_"]["_child"]: # Array of Objects
             recursive_calls_args_list.append({"fields_schema": field_meta["_"]["_child"]["_"], "interface_table_prefix": interface_table_prefix,
                 "interface_chinese_name": interface_chinese_name, "current_path": current_path + [field_key],
                 "master_table_actual_name": actual_detail_table_name})
-        else:
-            columns.append(gen_column_sql(field_key, field_meta.get("type", "String"), field_meta.get("remark", "")))
+            # Array of complex objects implies a child table; typically no column for the array itself in parent,
+            # unless we decide to also store it as JSON (e.g. for simple arrays not just of objects).
+            # Current gen_column_sql would default Array to JSON if notice doesn't specify.
+            # If it's an array of complex objects handled by recursion, we might not want a JSON column here.
+            # For now, let's assume if it's complex enough for recursion, we don't add a direct JSON column for the whole array.
+            # However, apijsontosql4.py's original logic for "Array" type in gen_column_sql maps to JSON.
+            # This needs to be consistent: if a child table is created for an array's items,
+            # do we still want a JSON column in the parent for the raw array?
+            # Let's assume NO for arrays that spawn child tables.
+            # If it was an array of simple types, notice might say "JSON" or type="Array" would map to JSON.
+            # This part is subtle. If field_meta['_']['_child']['_'] exists, it's complex.
+        else: # Simple field, or Object/Array to be stored as JSON directly (no further "_" structure)
+            columns.append(gen_column_sql(field_key, col_type_from_meta, col_remark, notice_val))
 
     table_comment_suffix = " - " + "_".join(current_path) if current_path and current_path != ["items"] else ""
     table_comment = f"{interface_chinese_name}{table_comment_suffix} 详细信息"
